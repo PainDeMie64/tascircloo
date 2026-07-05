@@ -2,5 +2,10 @@
 	"$schema": "./node_modules/wrangler/config-schema.json",
 	"name": "circloo-tas",
 	"compatibility_date": "2026-07-06",
-	"pages_build_output_dir": ".svelte-kit/cloudflare"
+	"compatibility_flags": ["nodejs_compat"],
+	"main": ".svelte-kit/cloudflare/_worker.js",
+	"assets": {
+		"directory": ".svelte-kit/cloudflare",
+		"binding": "ASSETS"
+	}
 }
