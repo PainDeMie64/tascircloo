@@ -226,6 +226,10 @@
 		return gmObj(20);
 	}
 
+	function hasPlayer() {
+		return !!gmPlayer();
+	}
+
 	function gmBig() {
 		return gmObj(1);
 	}
@@ -242,7 +246,7 @@
 
 	function captureFrame() {
 		const frame = gameFrame();
-		return frame > 0 ? frame : state.wallFrame;
+		return hasPlayer() ? frame : state.wallFrame;
 	}
 
 	function radiusCP() {
@@ -823,6 +827,12 @@
 		return sameGameInstance(self, player) || sameGameInstance(this, player);
 	}
 
+	function shouldCaptureInput(self, code) {
+		if (state.playbackMode || state.paused || !isVirtualCode(code)) return false;
+		const player = gmPlayer();
+		return sameGameInstance(self, player) || sameGameInstance(this, player);
+	}
+
 	function nativeInputHeld(code) {
 		const check = state.originalInputCheck || (typeof W._J3 === 'function' ? W._J3 : null);
 		if (typeof check !== 'function') return false;
@@ -855,6 +865,7 @@
 			state.originalInputCheck = W[inputCheckName];
 			W[inputCheckName] = function patchedInputCheck(self, other, code) {
 				const nativeValue = state.originalInputCheck.apply(this, arguments);
+				if (shouldCaptureInput.call(this, self, code)) sampleCapture(gameFrame());
 				if (!shouldUseVirtualInput.call(this, self, code)) return nativeValue;
 				return overlayInput(nativeValue, virtualCheck(code));
 			};
@@ -864,6 +875,7 @@
 			state.originalInputPressed = W[inputPressedName];
 			W[inputPressedName] = function patchedInputPressed(self, other, code) {
 				const nativeValue = state.originalInputPressed.apply(this, arguments);
+				if (shouldCaptureInput.call(this, self, code)) sampleCapture(gameFrame());
 				if (!shouldUseVirtualInput.call(this, self, code)) return nativeValue;
 				return overlayInput(nativeValue, virtualPressed(code));
 			};
@@ -873,6 +885,7 @@
 			state.originalPokiInputCheck = W._R4;
 			W._R4 = function patchedPokiInputCheck(self, other, code) {
 				const nativeValue = state.originalPokiInputCheck.apply(this, arguments);
+				if (shouldCaptureInput.call(this, self, code)) sampleCapture(gameFrame());
 				if (!shouldUseVirtualInput.call(this, self, code)) return nativeValue;
 				return overlayInput(nativeValue, virtualCheck(code));
 			};
@@ -882,6 +895,7 @@
 			state.originalPokiInputPressed = W._S4;
 			W._S4 = function patchedPokiInputPressed(self, other, code) {
 				const nativeValue = state.originalPokiInputPressed.apply(this, arguments);
+				if (shouldCaptureInput.call(this, self, code)) sampleCapture(gameFrame());
 				if (!shouldUseVirtualInput.call(this, self, code)) return nativeValue;
 				return overlayInput(nativeValue, virtualPressed(code));
 			};
@@ -928,6 +942,7 @@
 		W._P8 = function patchedPlayerCreate(self, other) {
 			const result = state.originalPlayerCreate.apply(this, arguments);
 			beginFreshRun('player-create');
+			resetCapture();
 			return result;
 		};
 
@@ -944,17 +959,18 @@
 	function resetCapture() {
 		state.capture = [];
 		state.lastCaptureInput = null;
-		state.lastFrameSeen = captureFrame();
+		state.lastFrameSeen = hasPlayer() ? gameFrame() : null;
 		state.lastLevelSeen = gmLevel();
 		state.collectedCP = radiusCP();
 		state.lastCP = currentCP();
 		state.cpTimes = [];
 	}
 
-	function sampleCapture() {
+	function sampleCapture(frame = gameFrame()) {
 		if (state.playbackMode) return;
+		if (!hasPlayer()) return;
+		if (!Number.isFinite(frame)) return;
 
-		const frame = captureFrame();
 		const level = gmLevel();
 		if (state.lastLevelSeen !== null && level !== state.lastLevelSeen) resetCapture();
 		if (state.lastFrameSeen !== null && frame < state.lastFrameSeen - 3) resetCapture();
@@ -1261,7 +1277,6 @@
 		patchGameHooks();
 		updateCheckpointTracking();
 		updateVelocity();
-		sampleCapture();
 		recordRunFrame();
 		post('TELEMETRY', telemetry());
 		REAL.raf(monitorTick);
