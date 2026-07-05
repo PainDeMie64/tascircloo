@@ -1,0 +1,1568 @@
+// ==UserScript==
+// @name         CircloO Professional TAS Toolkit
+// @namespace    circloo-tas-toolkit
+// @version      3.3.0
+// @description  Professional TAS recorder/replayer/optimizer for Poki CircloO using actual GameMaker internals. v3.3 restores optimizer batch execution, keeps replay reset-safe, and silences hidden sim without breaking game init.
+// @author       ChatGPT
+// @match        *://*/*
+// @run-at       document-start
+// @all-frames   true
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  const W = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const D = W.document;
+
+  const REAL = {
+    setTimeout: W.setTimeout.bind(W),
+    clearTimeout: W.clearTimeout.bind(W),
+    setInterval: W.setInterval.bind(W),
+    clearInterval: W.clearInterval.bind(W),
+    raf: W.requestAnimationFrame
+      ? W.requestAnimationFrame.bind(W)
+      : cb => W.setTimeout(() => cb(Date.now()), 16),
+  };
+
+  const PARAMS = (() => {
+    try { return new URLSearchParams(W.location.search); }
+    catch { return new URLSearchParams(""); }
+  })();
+
+  const IS_SIM = PARAMS.get("__ctas_sim") === "1";
+  const SIM_TOKEN = PARAMS.get("__ctas_token") || "";
+
+  const GAME = {
+    bigObj: 1,
+    playerObj: 20,
+    leftCodes: new Set([37, 65]),
+    rightCodes: new Set([39, 68]),
+  };
+
+  const cfg = {
+    fps: 60,
+    seed: 0,
+    targetCP: 1,
+    finishCP: 7,
+    maxFrames: 3600,
+    mutRange: 10,
+    mutStep: 1,
+    batchSize: 64,
+    warmupFrames: 3,
+    autoUseBest: false,
+  };
+
+  const tas = {
+    installed: false,
+    originalInputCheck: null,
+    originalInputPressed: null,
+
+    virtualEnabled: false,
+    playbackMode: false,
+    paused: false,
+
+    script: [],
+    playIndex: 0,
+    playLastFrame: -1,
+    playLevel: null,
+    playArmedAt: 0,
+
+    virtual: { L: false, R: false },
+    prevVirtual: { L: false, R: false },
+
+    domHeld: { L: false, R: false },
+
+    capture: [],
+    lastCaptureInput: null,
+    lastFrameSeen: null,
+    lastLevelSeen: null,
+
+    lastCP: 0,
+    cpTimes: [],
+
+    lastPlayer: null,
+    velocity: { vx: 0, vy: 0, speed: 0 },
+
+    optimizer: {
+      running: false,
+      sim: null,
+      best: [],
+      bestScore: Infinity,
+      trials: 0,
+      batches: 0,
+      improved: 0,
+      startedAt: 0,
+      lastScore: Infinity,
+      lastReached: false,
+      lastError: "",
+    }
+  };
+
+  const ui = {};
+
+  if (IS_SIM) {
+    installNoAudio();
+    installFastClock();
+    installNoRenderCanvas();
+  }
+
+  function isGameFrame() {
+    return !!D.getElementById("canvas") ||
+      /gdn\.poki|html5game|games\.poki\.com|game-cdn/i.test(W.location.href);
+  }
+
+  function getCanvas() {
+    return D.getElementById("canvas") || D.querySelector("canvas");
+  }
+
+  function gmReady() {
+    return typeof W._He === "function" &&
+      typeof W._Lg === "function" &&
+      typeof W._R4 === "function" &&
+      typeof W._S4 === "function" &&
+      !!getCanvas();
+  }
+
+  function coreReady() {
+    return gmReady() &&
+      typeof W._k5 === "function" &&
+      typeof W._45 === "function" &&
+      W.global;
+  }
+
+  function gmObj(id) {
+    try { return W._He(id); }
+    catch { return null; }
+  }
+
+  function gmLevel() {
+    try { return Number(W.global && W.global._Ad); }
+    catch { return NaN; }
+  }
+
+  function gmPlayer() {
+    return gmObj(GAME.playerObj);
+  }
+
+  function gmBig() {
+    return gmObj(GAME.bigObj);
+  }
+
+  function gameFrame() {
+    const p = gmPlayer();
+    return p && Number.isFinite(p._In) ? Math.max(0, Math.floor(p._In)) : 0;
+  }
+
+  function gameTimerText(frames = gameFrame()) {
+    try {
+      if (typeof W._45 === "function") return String(W._45(null, null, frames));
+    } catch {}
+
+    if (!Number.isFinite(frames) || frames < 0) return "---";
+
+    const totalSeconds = Math.floor(frames / 60);
+    const min = Math.floor(totalSeconds / 60);
+    const sec = String(totalSeconds % 60).padStart(2, "0");
+    const centi = String(Math.floor((frames % 60) / 60 * 100)).padStart(2, "0");
+
+    return `${min}:${sec}.${centi}`;
+  }
+
+  function currentCP() {
+    const b = gmBig();
+    if (!b || !Number.isFinite(b._Ie)) return 0;
+
+    const step = Number.isFinite(b._Me) && b._Me > 0 ? b._Me : 200;
+    return Math.max(0, Math.floor((b._Ie + 0.01) / step) - 1);
+  }
+
+  function playerPos() {
+    const p = gmPlayer();
+    if (!p) return null;
+    return { x: Number(p.x), y: Number(p.y) };
+  }
+
+  function gameStarted() {
+    const p = gmPlayer();
+    return !!p && Number.isFinite(p._In);
+  }
+
+  function inputOfHeld(h) {
+    if (h.L && h.R) return "LR";
+    if (h.L) return "L";
+    if (h.R) return "R";
+    return ".";
+  }
+
+  function parseInput(s) {
+    s = String(s || ".").toUpperCase();
+    return {
+      L: s.includes("L") || s.includes("<"),
+      R: s.includes("R") || s.includes(">"),
+    };
+  }
+
+  function frameFromToken(tok) {
+    tok = String(tok || "").trim();
+
+    if (/^\d+$/.test(tok)) return Number(tok);
+
+    const m = tok.match(/^(?:(\d+):)?(\d{1,2})(?:\.(\d{1,2}))?$/);
+    if (!m) return NaN;
+
+    const min = Number(m[1] || 0);
+    const sec = Number(m[2] || 0);
+    const centi = Number((m[3] || "0").padEnd(2, "0").slice(0, 2));
+
+    return Math.round((min * 60 + sec + centi / 100) * 60);
+  }
+
+  function normalizeScript(textOrArray) {
+    if (Array.isArray(textOrArray)) return normalizeScript(serialize(textOrArray));
+
+    const out = [];
+
+    for (const raw of String(textOrArray || "").split(/\n+/)) {
+      const line = raw.replace(/#.*/, "").trim();
+      if (!line) continue;
+
+      const parts = line.split(/[,:;\s]+/).filter(Boolean);
+      if (parts.length < 2) continue;
+
+      const frame = frameFromToken(parts[0]);
+      if (!Number.isFinite(frame)) continue;
+
+      out.push({
+        frame: Math.max(0, Math.round(frame)),
+        input: inputOfHeld(parseInput(parts.slice(1).join("")))
+      });
+    }
+
+    out.sort((a, b) => a.frame - b.frame);
+
+    const compact = [];
+
+    for (const e of out) {
+      if (compact.length && compact[compact.length - 1].frame === e.frame) {
+        compact[compact.length - 1] = e;
+      } else if (!compact.length || compact[compact.length - 1].input !== e.input) {
+        compact.push(e);
+      }
+    }
+
+    if (!compact.length || compact[0].frame !== 0) {
+      compact.unshift({ frame: 0, input: "." });
+    }
+
+    return compact;
+  }
+
+  function serialize(script) {
+    return (script || [])
+      .map(e => `${Math.max(0, Math.round(e.frame))} ${e.input}`)
+      .join("\n");
+  }
+
+  function status(s) {
+    if (ui.status) ui.status.textContent = s;
+  }
+
+  function isUiTarget(target) {
+    try {
+      return !!(target && target.closest && target.closest("#ctas-host,#ctas-mini"));
+    } catch {
+      return false;
+    }
+  }
+
+  function installEventGate() {
+    if (IS_SIM) return;
+
+    const ET = W.EventTarget && W.EventTarget.prototype;
+    if (!ET || ET.__ctasGate) return;
+
+    ET.__ctasGate = true;
+
+    const rawAdd = ET.addEventListener;
+    const rawRemove = ET.removeEventListener;
+    const map = new WeakMap();
+    const gatedTypes =
+      /^(key|input|beforeinput|composition|paste|cut|copy|mouse|pointer|touch|wheel|click|dblclick)/i;
+
+    function wrap(listener) {
+      if (!listener || listener.__ctasInternal) return listener;
+      if (map.has(listener)) return map.get(listener);
+
+      let w = listener;
+
+      if (typeof listener === "function") {
+        w = function(ev) {
+          if (gatedTypes.test(ev.type) && isUiTarget(ev.target)) return;
+          return listener.call(this, ev);
+        };
+      } else if (listener && typeof listener.handleEvent === "function") {
+        w = {
+          handleEvent(ev) {
+            if (gatedTypes.test(ev.type) && isUiTarget(ev.target)) return;
+            return listener.handleEvent.call(listener, ev);
+          }
+        };
+      }
+
+      map.set(listener, w);
+      return w;
+    }
+
+    ET.addEventListener = function(type, listener, opts) {
+      return rawAdd.call(this, type, wrap(listener), opts);
+    };
+
+    ET.removeEventListener = function(type, listener, opts) {
+      return rawRemove.call(this, type, map.get(listener) || listener, opts);
+    };
+
+    W.__ctasRawAdd = rawAdd;
+  }
+
+  function rawAdd(target, type, fn, opts) {
+    try { fn.__ctasInternal = true; } catch {}
+
+    const add = W.__ctasRawAdd || target.addEventListener;
+    return add.call(target, type, fn, opts);
+  }
+
+  function setVirtualInput(input) {
+    tas.prevVirtual = { ...tas.virtual };
+    tas.virtual = parseInput(input);
+  }
+
+  function hardResetPlaybackState() {
+    tas.playIndex = 0;
+    tas.playLastFrame = -1;
+    tas.playLevel = gmLevel();
+    tas.paused = false;
+    tas.prevVirtual = { L: false, R: false };
+    tas.virtual = { L: false, R: false };
+  }
+
+  function softResetPlaybackForLevel(level = gmLevel()) {
+    tas.playIndex = 0;
+    tas.playLastFrame = -1;
+    tas.playLevel = level;
+    tas.prevVirtual = { L: false, R: false };
+    tas.virtual = { L: false, R: false };
+  }
+
+  function applyPlaybackForFrame(frame) {
+    if (!tas.playbackMode || tas.paused) return;
+
+    const level = gmLevel();
+
+    if (tas.playLevel == null || level !== tas.playLevel) {
+      softResetPlaybackForLevel(level);
+    }
+
+    if (!Number.isFinite(frame)) return;
+
+    if (tas.playLastFrame >= 0 && frame < tas.playLastFrame - 1) {
+      softResetPlaybackForLevel(level);
+    }
+
+    tas.playLastFrame = frame;
+
+    while (tas.playIndex < tas.script.length && tas.script[tas.playIndex].frame <= frame) {
+      setVirtualInput(tas.script[tas.playIndex].input);
+      tas.playIndex++;
+    }
+  }
+
+  function patchedInputCheck(self, other, code) {
+    const c = Number(code);
+
+    if (tas.virtualEnabled && (GAME.leftCodes.has(c) || GAME.rightCodes.has(c))) {
+      applyPlaybackForFrame(gameFrame());
+      return GAME.leftCodes.has(c)
+        ? (tas.virtual.L ? 1 : 0)
+        : (tas.virtual.R ? 1 : 0);
+    }
+
+    return tas.originalInputCheck.apply(this, arguments);
+  }
+
+  function patchedInputPressed(self, other, code) {
+    const c = Number(code);
+
+    if (tas.virtualEnabled && (GAME.leftCodes.has(c) || GAME.rightCodes.has(c))) {
+      applyPlaybackForFrame(gameFrame());
+
+      if (GAME.leftCodes.has(c)) return tas.virtual.L && !tas.prevVirtual.L ? 1 : 0;
+      if (GAME.rightCodes.has(c)) return tas.virtual.R && !tas.prevVirtual.R ? 1 : 0;
+    }
+
+    return tas.originalInputPressed.apply(this, arguments);
+  }
+
+  function patchGameInput() {
+    if (tas.installed || !gmReady()) return false;
+
+    tas.originalInputCheck = W._R4;
+    tas.originalInputPressed = W._S4;
+
+    W._R4 = patchedInputCheck;
+    W._S4 = patchedInputPressed;
+
+    tas.installed = true;
+    return true;
+  }
+
+  function seedRandom(seed) {
+    let a = (seed | 0) || 1;
+
+    return function() {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function forceSeed(seed) {
+    try {
+      if (typeof W._3G === "function") W._3G(seed | 0);
+    } catch {}
+
+    try {
+      W.Math.random = seedRandom(seed);
+    } catch {}
+  }
+
+  function resetCapture() {
+    tas.capture = [];
+    tas.lastCaptureInput = null;
+    tas.lastFrameSeen = gameFrame();
+    tas.lastLevelSeen = gmLevel();
+    tas.lastCP = currentCP();
+    tas.cpTimes = [];
+
+    if (ui.capture) ui.capture.textContent = "captured: 0 changes";
+  }
+
+  function sampleCapture() {
+    if (tas.playbackMode || !gameStarted()) return;
+
+    const frame = gameFrame();
+    const level = gmLevel();
+
+    if (tas.lastLevelSeen !== null && level !== tas.lastLevelSeen) resetCapture();
+    if (tas.lastFrameSeen !== null && frame < tas.lastFrameSeen - 3) resetCapture();
+
+    tas.lastFrameSeen = frame;
+    tas.lastLevelSeen = level;
+
+    const inp = inputOfHeld(tas.domHeld);
+
+    if (tas.lastCaptureInput === null || inp !== tas.lastCaptureInput) {
+      tas.capture.push({ frame, input: inp });
+      tas.lastCaptureInput = inp;
+
+      if (ui.capture) ui.capture.textContent = `captured: ${tas.capture.length} changes`;
+    }
+  }
+
+  function updateCheckpointTracking() {
+    const cp = currentCP();
+
+    if (cp > tas.lastCP) {
+      for (let n = tas.lastCP + 1; n <= cp; n++) {
+        tas.cpTimes[n] = gameFrame();
+      }
+
+      tas.lastCP = cp;
+    } else if (cp < tas.lastCP) {
+      tas.lastCP = cp;
+      tas.cpTimes = tas.cpTimes.slice(0, cp + 1);
+    }
+  }
+
+  function updateVelocity() {
+    const pos = playerPos();
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return;
+
+    const frame = gameFrame();
+
+    if (tas.lastPlayer && frame !== tas.lastPlayer.frame) {
+      const df = Math.max(1, frame - tas.lastPlayer.frame);
+
+      tas.velocity.vx = (pos.x - tas.lastPlayer.x) / df * 60;
+      tas.velocity.vy = (pos.y - tas.lastPlayer.y) / df * 60;
+      tas.velocity.speed = Math.hypot(tas.velocity.vx, tas.velocity.vy);
+    }
+
+    tas.lastPlayer = { ...pos, frame };
+  }
+
+  function monitorTick() {
+    if (gmReady()) patchGameInput();
+
+    updateCheckpointTracking();
+    updateVelocity();
+    sampleCapture();
+    renderHUD();
+
+    REAL.raf(monitorTick);
+  }
+
+  function renderHUD() {
+    if (IS_SIM || !ui.host || !gmReady()) return;
+
+    const f = gameFrame();
+    const cp = currentCP();
+    const target = Math.max(1, cfg.targetCP | 0);
+    const cpFrame = tas.cpTimes[target] ?? null;
+
+    ui.time.textContent = `game ${gameTimerText(f)} / frame ${f}`;
+    ui.cp.textContent =
+      `CP ${target}: ${cpFrame == null ? "--" : gameTimerText(cpFrame)}   current CPs: ${cp}`;
+    ui.input.textContent =
+      `input ${tas.playbackMode ? inputOfHeld(tas.virtual) : inputOfHeld(tas.domHeld)}   ` +
+      `v ${tas.velocity.speed.toFixed(1)} (${tas.velocity.vx.toFixed(1)}, ${tas.velocity.vy.toFixed(1)})`;
+
+    if (tas.optimizer.running) {
+      const dt = Math.max(0.001, (performance.now() - tas.optimizer.startedAt) / 1000);
+      const rate = (tas.optimizer.trials / dt).toFixed(1);
+
+      ui.opt.textContent =
+        `optimizer: ${tas.optimizer.trials} trials (${tas.optimizer.batches} batches), ` +
+        `${rate}/s, best ${
+          Number.isFinite(tas.optimizer.bestScore) ? gameTimerText(tas.optimizer.bestScore) : "unreached"
+        }, improvements ${tas.optimizer.improved}` +
+        (tas.optimizer.lastError ? `, last error: ${tas.optimizer.lastError}` : "");
+    }
+  }
+
+  function armReplay() {
+    syncCfg();
+
+    const parsed = normalizeScript(ui.script.value);
+    tas.script = parsed;
+    ui.script.value = serialize(parsed);
+
+    hardResetPlaybackState();
+
+    tas.virtualEnabled = true;
+    tas.playbackMode = true;
+    tas.paused = false;
+    tas.playArmedAt = performance.now();
+
+    setVirtualInput(".");
+    forceSeed(cfg.seed);
+
+    status("replay armed/reset: restart or start the level; script inputs will be used");
+  }
+
+  function stopReplay() {
+    tas.playbackMode = false;
+    tas.paused = false;
+    tas.virtualEnabled = false;
+
+    hardResetPlaybackState();
+    setVirtualInput(".");
+
+    status("recording");
+  }
+
+  function togglePause() {
+    if (!tas.playbackMode) return;
+
+    tas.paused = !tas.paused;
+
+    if (tas.paused) setVirtualInput(".");
+
+    status(tas.paused ? "replay paused" : "replay armed");
+  }
+
+  function dumpRun() {
+    sampleCapture();
+
+    const s = normalizeScript(tas.capture);
+    ui.script.value = serialize(s);
+
+    status(`dumped ${s.length} input changes`);
+  }
+
+  function useBest() {
+    if (!tas.optimizer.best.length) return status("no best script yet");
+
+    ui.script.value = serialize(tas.optimizer.best);
+    status("loaded optimizer best script");
+  }
+
+  function saveLocal() {
+    const name = prompt("Save TAS as:", "circloo-tas");
+    if (!name) return;
+
+    localStorage.setItem("ctas:" + name, ui.script.value);
+    status("saved");
+  }
+
+  function loadLocal() {
+    const names = Object.keys(localStorage)
+      .filter(k => k.startsWith("ctas:"))
+      .map(k => k.slice(5));
+
+    const name = prompt("Load TAS:\n" + names.join("\n"), names[0] || "");
+    if (!name) return;
+
+    ui.script.value = localStorage.getItem("ctas:" + name) || "";
+    status("loaded");
+  }
+
+  function syncCfg() {
+    if (!ui.host) return;
+
+    cfg.seed = Number(ui.seed.value) | 0;
+    cfg.targetCP = Math.max(1, Math.floor(Number(ui.targetCP.value) || 1));
+    cfg.finishCP = Math.max(1, Math.floor(Number(ui.finishCP.value) || 7));
+    cfg.maxFrames = Math.max(60, Math.floor(Number(ui.maxFrames.value) || 3600));
+    cfg.mutRange = Math.max(0, Math.floor(Number(ui.mutRange.value) || 8));
+    cfg.mutStep = Math.max(1, Math.floor(Number(ui.mutStep.value) || 1));
+    cfg.batchSize = Math.max(1, Math.min(512, Math.floor(Number(ui.batchSize.value) || 64)));
+    cfg.warmupFrames = Math.max(0, Math.min(120, Math.floor(Number(ui.warmupFrames.value) || 3)));
+    cfg.autoUseBest = !!ui.autoUseBest.checked;
+  }
+
+  function hideUI() {
+    ui.host.style.display = "none";
+    ui.mini.style.display = "block";
+  }
+
+  function showUI() {
+    ui.host.style.display = "block";
+    ui.mini.style.display = "none";
+  }
+
+  function buildUI() {
+    if (IS_SIM || D.getElementById("ctas-host")) return;
+
+    installEventGate();
+
+    const style = D.createElement("style");
+
+    style.textContent = `
+      #ctas-host{
+        position:fixed;
+        right:12px;
+        top:12px;
+        width:410px;
+        max-height:94vh;
+        z-index:2147483647;
+        font:12px/1.35 system-ui,Segoe UI,Arial,sans-serif;
+        color:#eef;
+        background:rgba(8,10,15,.94);
+        border:1px solid #58647a;
+        border-radius:12px;
+        box-shadow:0 10px 32px #0008;
+        padding:10px;
+        overflow:auto;
+      }
+      #ctas-host *{box-sizing:border-box}
+      #ctas-host textarea,#ctas-host input,#ctas-host select{
+        background:#111827;
+        color:#d1fae5;
+        border:1px solid #374151;
+        border-radius:6px;
+        padding:4px;
+        font:12px ui-monospace,SFMono-Regular,Consolas,monospace;
+      }
+      #ctas-host textarea{
+        width:100%;
+        height:180px;
+        resize:vertical;
+        margin-top:8px;
+      }
+      #ctas-host button,#ctas-mini{
+        background:#1f2937;
+        color:#fff;
+        border:1px solid #4b5563;
+        border-radius:7px;
+        padding:5px 8px;
+        margin:2px;
+        cursor:pointer;
+      }
+      #ctas-host button.primary{background:#2563eb;border-color:#60a5fa}
+      #ctas-host button.danger{background:#7f1d1d;border-color:#ef4444}
+      #ctas-host .row{
+        display:flex;
+        gap:6px;
+        align-items:center;
+        flex-wrap:wrap;
+        margin-top:6px;
+      }
+      #ctas-host .grid{
+        display:grid;
+        grid-template-columns:1fr 1fr;
+        gap:2px 8px;
+        margin-top:5px;
+      }
+      #ctas-host .muted{color:#9ca3af}
+      #ctas-mini{
+        display:none;
+        position:fixed;
+        right:12px;
+        top:12px;
+        z-index:2147483647;
+      }
+    `;
+
+    D.documentElement.appendChild(style);
+
+    const mini = D.createElement("button");
+    mini.id = "ctas-mini";
+    mini.textContent = "Show TAS";
+    D.documentElement.appendChild(mini);
+    ui.mini = mini;
+
+    const host = D.createElement("div");
+    host.id = "ctas-host";
+
+    host.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+        <b style="font-size:14px">CirclO TAS Pro v3.3 Turbo</b>
+        <button id="ctas-hide">Hide</button>
+      </div>
+
+      <div id="ctas-status" class="muted">waiting for GameMaker internals…</div>
+
+      <div class="grid">
+        <div id="ctas-time">game --</div>
+        <div id="ctas-cp">CP --</div>
+      </div>
+
+      <div id="ctas-input" class="muted">input .</div>
+      <div id="ctas-capture" style="color:#86efac">captured: 0 changes</div>
+      <div id="ctas-opt" style="color:#86efac"></div>
+
+      <textarea id="ctas-script" spellcheck="false" placeholder="Script format: frame input
+0 .
+12 R
+68 .
+90 L"></textarea>
+
+      <div class="row">
+        <button id="ctas-dump" class="primary">Dump Run</button>
+        <button id="ctas-clear">Clear Capture</button>
+        <button id="ctas-replay" class="primary">Arm Replay</button>
+        <button id="ctas-pause">Pause</button>
+        <button id="ctas-stop" class="danger">Stop</button>
+      </div>
+
+      <div class="row">
+        <button id="ctas-optbtn" class="primary">Optimize</button>
+        <button id="ctas-best">Use Best</button>
+        <label><input id="ctas-auto-best" type="checkbox"> auto-load best</label>
+        <button id="ctas-save">Save</button>
+        <button id="ctas-load">Load</button>
+      </div>
+
+      <div class="row">
+        Target
+        <select id="ctas-target">
+          <option value="cp">Nth checkpoint</option>
+          <option value="finish">Finish</option>
+        </select>
+        CP N <input id="ctas-target-cp" value="1" style="width:46px">
+        Finish CPs <input id="ctas-finish-cp" value="7" style="width:46px">
+      </div>
+
+      <div class="row">
+        Mutation ±<input id="ctas-mut-range" value="8" style="width:46px">
+        step <input id="ctas-mut-step" value="1" style="width:46px">
+        max frames <input id="ctas-max-frames" value="3600" style="width:70px">
+      </div>
+
+      <div class="row">
+        Batch <input id="ctas-batch-size" value="64" style="width:54px">
+        warmup <input id="ctas-warmup" value="3" style="width:46px">
+        Seed <input id="ctas-seed" value="0" style="width:70px">
+      </div>
+
+      <div class="muted" style="margin-top:6px">
+        Optimize always uses the current textarea as the starting base. Every improvement becomes the next mutation base.
+        Hidden simulator disables rendering and silences audio without replacing the browser Audio constructor.
+      </div>
+    `;
+
+    D.documentElement.appendChild(host);
+    ui.host = host;
+
+    for (const type of [
+      "click", "mousedown", "mouseup", "pointerdown", "pointerup", "wheel",
+      "keydown", "keyup", "keypress", "input", "beforeinput", "paste", "copy", "cut"
+    ]) {
+      rawAdd(host, type, e => e.stopPropagation(), false);
+      rawAdd(mini, type, e => e.stopPropagation(), false);
+    }
+
+    ui.status = host.querySelector("#ctas-status");
+    ui.time = host.querySelector("#ctas-time");
+    ui.cp = host.querySelector("#ctas-cp");
+    ui.input = host.querySelector("#ctas-input");
+    ui.capture = host.querySelector("#ctas-capture");
+    ui.opt = host.querySelector("#ctas-opt");
+    ui.script = host.querySelector("#ctas-script");
+    ui.target = host.querySelector("#ctas-target");
+    ui.targetCP = host.querySelector("#ctas-target-cp");
+    ui.finishCP = host.querySelector("#ctas-finish-cp");
+    ui.maxFrames = host.querySelector("#ctas-max-frames");
+    ui.mutRange = host.querySelector("#ctas-mut-range");
+    ui.mutStep = host.querySelector("#ctas-mut-step");
+    ui.batchSize = host.querySelector("#ctas-batch-size");
+    ui.warmupFrames = host.querySelector("#ctas-warmup");
+    ui.seed = host.querySelector("#ctas-seed");
+    ui.autoUseBest = host.querySelector("#ctas-auto-best");
+
+    rawAdd(mini, "click", showUI, false);
+    rawAdd(host.querySelector("#ctas-hide"), "click", hideUI, false);
+    rawAdd(host.querySelector("#ctas-dump"), "click", dumpRun, false);
+    rawAdd(host.querySelector("#ctas-clear"), "click", () => {
+      resetCapture();
+      status("capture cleared");
+    }, false);
+    rawAdd(host.querySelector("#ctas-replay"), "click", armReplay, false);
+    rawAdd(host.querySelector("#ctas-pause"), "click", togglePause, false);
+    rawAdd(host.querySelector("#ctas-stop"), "click", () => {
+      stopReplay();
+      stopOptimizer();
+    }, false);
+    rawAdd(host.querySelector("#ctas-optbtn"), "click", toggleOptimizer, false);
+    rawAdd(host.querySelector("#ctas-best"), "click", useBest, false);
+    rawAdd(host.querySelector("#ctas-save"), "click", saveLocal, false);
+    rawAdd(host.querySelector("#ctas-load"), "click", loadLocal, false);
+
+    for (const el of [
+      ui.seed,
+      ui.targetCP,
+      ui.finishCP,
+      ui.maxFrames,
+      ui.mutRange,
+      ui.mutStep,
+      ui.batchSize,
+      ui.warmupFrames,
+      ui.autoUseBest
+    ]) {
+      rawAdd(el, "input", syncCfg, false);
+      rawAdd(el, "change", syncCfg, false);
+    }
+
+    status("recording");
+  }
+
+  function mutateScript(base) {
+    const s = normalizeScript(base);
+    if (!s.length) return s;
+
+    const inputs = [".", "L", "R", "LR"];
+    const op = Math.random();
+
+    if (op < 0.62) {
+      const i = Math.floor(Math.random() * s.length);
+      const shift =
+        (Math.floor(Math.random() * (cfg.mutRange * 2 + 1)) - cfg.mutRange) * cfg.mutStep;
+
+      s[i].frame = Math.max(0, s[i].frame + shift);
+    } else if (op < 0.82) {
+      const last = Math.max(60, s[s.length - 1].frame + 120);
+
+      s.push({
+        frame: Math.floor(Math.random() * last),
+        input: inputs[Math.floor(Math.random() * inputs.length)]
+      });
+    } else if (op < 0.92 && s.length > 1) {
+      s.splice(1 + Math.floor(Math.random() * (s.length - 1)), 1);
+    } else {
+      const i = Math.floor(Math.random() * s.length);
+      s[i].input = inputs[Math.floor(Math.random() * inputs.length)];
+    }
+
+    return normalizeScript(s);
+  }
+
+  function simUrl() {
+    const u = new URL(W.location.href);
+
+    u.searchParams.set("__ctas_sim", "1");
+    u.searchParams.set("__ctas_token", `${Date.now()}_${Math.random().toString(36).slice(2)}`);
+
+    return u.href;
+  }
+
+  function createSim() {
+    return new Promise((resolve, reject) => {
+      const iframe = D.createElement("iframe");
+
+      iframe.style.cssText =
+        "position:fixed;left:-30000px;top:-30000px;width:900px;height:700px;opacity:.01;pointer-events:none;border:0";
+
+      iframe.src = simUrl();
+
+      const token = new URL(iframe.src).searchParams.get("__ctas_token");
+
+      const timeout = REAL.setTimeout(() => {
+        cleanup(new Error("hidden simulator did not initialize"));
+      }, 20000);
+
+      function onMsg(ev) {
+        const d = ev.data || {};
+
+        if (d.type === "CTAS_SIM_READY" && d.token === token && ev.source === iframe.contentWindow) {
+          cleanup(null, iframe);
+        }
+      }
+
+      function cleanup(err, result) {
+        REAL.clearTimeout(timeout);
+        W.removeEventListener("message", onMsg, true);
+
+        if (err) {
+          try { iframe.remove(); } catch {}
+          reject(err);
+        } else {
+          resolve({ iframe, token });
+        }
+      }
+
+      W.addEventListener("message", onMsg, true);
+      D.documentElement.appendChild(iframe);
+    });
+  }
+
+  async function getSim() {
+    if (tas.optimizer.sim && tas.optimizer.sim.iframe.isConnected) {
+      return tas.optimizer.sim;
+    }
+
+    tas.optimizer.sim = await createSim();
+    return tas.optimizer.sim;
+  }
+
+  function runBatch(scripts) {
+    return new Promise(async (resolve, reject) => {
+      const sim = await getSim().catch(reject);
+      if (!sim) return;
+
+      const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+      const timeout = REAL.setTimeout(() => {
+        done(new Error("batch timed out"));
+      }, 30000);
+
+      function onMsg(ev) {
+        const d = ev.data || {};
+
+        if (ev.source === sim.iframe.contentWindow && d.type === "CTAS_BATCH_RESULT" && d.id === id) {
+          done(null, d);
+        }
+      }
+
+      function done(err, data) {
+        REAL.clearTimeout(timeout);
+        W.removeEventListener("message", onMsg, true);
+
+        if (err) reject(err);
+        else if (data && data.error) reject(new Error(data.error));
+        else resolve(data);
+      }
+
+      W.addEventListener("message", onMsg, true);
+
+      sim.iframe.contentWindow.postMessage({
+        type: "CTAS_RUN_BATCH",
+        id,
+        scripts,
+        seed: cfg.seed,
+        level: gmLevel(),
+        target: ui.target.value,
+        targetCP: cfg.targetCP,
+        finishCP: cfg.finishCP,
+        maxFrames: cfg.maxFrames,
+        warmup: cfg.warmupFrames,
+      }, "*");
+    });
+  }
+
+  async function toggleOptimizer() {
+    if (tas.optimizer.running) return stopOptimizer();
+
+    syncCfg();
+
+    const base = normalizeScript(ui.script.value);
+
+    if (!base.length) {
+      return status("no script: Dump Run or paste inputs first");
+    }
+
+    ui.script.value = serialize(base);
+
+    tas.optimizer.running = true;
+    tas.optimizer.best = base.slice();
+    tas.optimizer.bestScore = Infinity;
+    tas.optimizer.trials = 0;
+    tas.optimizer.batches = 0;
+    tas.optimizer.improved = 0;
+    tas.optimizer.startedAt = performance.now();
+    tas.optimizer.lastError = "";
+
+    status("optimizer starting hidden no-render/no-audio simulator…");
+
+    try {
+      const baseResult = await runBatch([base]);
+
+      tas.optimizer.trials += baseResult.trials || 1;
+      tas.optimizer.batches++;
+      tas.optimizer.bestScore = baseResult.bestScore;
+      tas.optimizer.lastReached = baseResult.bestReached;
+    } catch (e) {
+      stopOptimizer();
+      status("optimizer failed: " + (e && e.message || e));
+      return;
+    }
+
+    status("optimizer running");
+    optimizerLoop();
+  }
+
+  function stopOptimizer() {
+    tas.optimizer.running = false;
+
+    if (ui.opt) ui.opt.textContent = "optimizer stopped";
+  }
+
+  async function optimizerLoop() {
+    while (tas.optimizer.running) {
+      syncCfg();
+
+      const base = tas.optimizer.best.length
+        ? tas.optimizer.best
+        : normalizeScript(ui.script.value);
+
+      const batch = [];
+
+      for (let i = 0; i < cfg.batchSize; i++) {
+        batch.push(mutateScript(base));
+      }
+
+      try {
+        const r = await runBatch(batch);
+
+        tas.optimizer.trials += r.trials || batch.length;
+        tas.optimizer.batches++;
+        tas.optimizer.lastScore = r.bestScore;
+        tas.optimizer.lastReached = r.bestReached;
+        tas.optimizer.lastError = "";
+
+        if (r.bestScore < tas.optimizer.bestScore && r.bestIndex >= 0) {
+          const improved = normalizeScript(batch[r.bestIndex]);
+
+          tas.optimizer.bestScore = r.bestScore;
+          tas.optimizer.best = improved;
+          tas.optimizer.improved++;
+
+          if (cfg.autoUseBest) {
+            ui.script.value = serialize(improved);
+          }
+
+          status(`improved: ${gameTimerText(r.bestScore)}; improvement is now mutation base`);
+        }
+      } catch (e) {
+        tas.optimizer.lastError = String(e && e.message || e);
+        tas.optimizer.batches++;
+      }
+
+      renderHUD();
+
+      await new Promise(r => REAL.setTimeout(r, 0));
+    }
+  }
+
+  function installNoAudio() {
+    if (W.__ctasNoAudioInstalled) return;
+    W.__ctasNoAudioInstalled = true;
+
+    const noop = function() {};
+
+    try {
+      const media = W.HTMLMediaElement && W.HTMLMediaElement.prototype;
+
+      if (media && !media.__ctasNoAudio) {
+        media.__ctasNoAudio = true;
+        media.play = function() { return Promise.resolve(); };
+        media.pause = noop;
+
+        try {
+          Object.defineProperty(media, "muted", {
+            get() { return true; },
+            set() {},
+            configurable: true
+          });
+        } catch {}
+
+        try {
+          Object.defineProperty(media, "volume", {
+            get() { return 0; },
+            set() {},
+            configurable: true
+          });
+        } catch {}
+      }
+    } catch {}
+
+    function patchWebAudioPrototypes() {
+      for (const C of [
+        W.AudioBufferSourceNode,
+        W.AudioScheduledSourceNode,
+        W.OscillatorNode,
+        W.ConstantSourceNode
+      ]) {
+        try {
+          if (C && C.prototype && !C.prototype.__ctasNoAudio) {
+            C.prototype.__ctasNoAudio = true;
+            if (typeof C.prototype.start === "function") C.prototype.start = noop;
+            if (typeof C.prototype.stop === "function") C.prototype.stop = noop;
+          }
+        } catch {}
+      }
+
+      for (const Ctx of [W.AudioContext, W.webkitAudioContext, W.OfflineAudioContext, W.webkitOfflineAudioContext]) {
+        try {
+          if (Ctx && Ctx.prototype && !Ctx.prototype.__ctasNoAudio) {
+            Ctx.prototype.__ctasNoAudio = true;
+
+            const oldCreateGain = Ctx.prototype.createGain;
+            if (typeof oldCreateGain === "function") {
+              Ctx.prototype.createGain = function() {
+                const g = oldCreateGain.apply(this, arguments);
+                try { g.gain.value = 0; } catch {}
+                return g;
+              };
+            }
+          }
+        } catch {}
+      }
+    }
+
+    patchWebAudioPrototypes();
+
+    function patchGameMakerAudio() {
+      patchWebAudioPrototypes();
+
+      try {
+        if (typeof W._Vn === "function" && !W._Vn.__ctasNoAudio) {
+          const f = function() { return -1; };
+          f.__ctasNoAudio = true;
+          W._Vn = f;
+        }
+      } catch {}
+
+      for (const name of ["_fj1", "_gj1"]) {
+        try {
+          if (typeof W[name] === "function" && !W[name].__ctasNoAudio) {
+            const f = function() {};
+            f.__ctasNoAudio = true;
+            W[name] = f;
+          }
+        } catch {}
+      }
+    }
+
+    W.__ctasPatchGameMakerAudio = patchGameMakerAudio;
+    patchGameMakerAudio();
+
+    let reapplies = 0;
+
+    const reapply = REAL.setInterval(() => {
+      patchGameMakerAudio();
+
+      if (++reapplies > 120) {
+        REAL.clearInterval(reapply);
+      }
+    }, 50);
+  }
+
+  function installFastClock() {
+    let simTime = 0;
+    let nextId = 1;
+
+    const timers = new Map();
+    const rafs = new Map();
+
+    function schedule(fn, delay, interval, args) {
+      const id = nextId++;
+
+      timers.set(id, {
+        time: simTime + Math.max(0, Number(delay) || 0),
+        interval,
+        fn,
+        args
+      });
+
+      return id;
+    }
+
+    W.setTimeout = (fn, delay, ...args) => schedule(fn, delay, 0, args);
+    W.setInterval = (fn, delay, ...args) =>
+      schedule(fn, delay, Math.max(1, Number(delay) || 1), args);
+    W.clearTimeout = id => timers.delete(id);
+    W.clearInterval = id => timers.delete(id);
+
+    W.requestAnimationFrame = cb => {
+      const id = nextId++;
+      rafs.set(id, cb);
+      return id;
+    };
+
+    W.cancelAnimationFrame = id => rafs.delete(id);
+
+    try {
+      W.Date.now = () => Math.floor(simTime);
+    } catch {}
+
+    try {
+      Object.defineProperty(W.performance, "now", {
+        value: () => simTime,
+        configurable: true
+      });
+    } catch {}
+
+    W.__ctasPumpFrame = () => {
+      simTime += 1000 / cfg.fps;
+
+      let guard = 0;
+
+      while (guard++ < 20000) {
+        let dueId = null;
+        let due = null;
+
+        for (const [id, t] of timers) {
+          if (t.time <= simTime && (!due || t.time < due.time)) {
+            dueId = id;
+            due = t;
+          }
+        }
+
+        if (!due) break;
+
+        if (due.interval) due.time += due.interval;
+        else timers.delete(dueId);
+
+        try {
+          typeof due.fn === "function" ? due.fn(...due.args) : W.eval(String(due.fn));
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      const callbacks = [...rafs.entries()];
+      rafs.clear();
+
+      for (const [, cb] of callbacks) {
+        try { cb(simTime); } catch (e) { console.error(e); }
+      }
+    };
+
+    W.__ctasPumpMany = n => {
+      for (let i = 0; i < n; i++) W.__ctasPumpFrame();
+    };
+
+    REAL.setInterval(() => {
+      if (!W.__ctasTrialActive && W.__ctasPumpMany) {
+        W.__ctasPumpMany(120);
+      }
+    }, 1);
+  }
+
+  function installNoRenderCanvas() {
+    const patch = () => {
+      const P = W.CanvasRenderingContext2D && W.CanvasRenderingContext2D.prototype;
+      if (!P || P.__ctasNoRender) return;
+
+      P.__ctasNoRender = true;
+
+      const noop = function() {};
+
+      const methods = [
+        "arc", "arcTo", "beginPath", "bezierCurveTo", "clearRect", "clip",
+        "closePath", "drawFocusIfNeeded", "drawImage", "ellipse", "fill",
+        "fillRect", "fillText", "lineTo", "moveTo", "quadraticCurveTo",
+        "rect", "reset", "resetTransform", "restore", "rotate", "roundRect",
+        "save", "scale", "setLineDash", "setTransform", "stroke", "strokeRect",
+        "strokeText", "transform", "translate", "putImageData"
+      ];
+
+      for (const m of methods) {
+        if (typeof P[m] === "function") P[m] = noop;
+      }
+
+      P.measureText = function(t) {
+        return {
+          width: String(t || "").length * 10,
+          actualBoundingBoxLeft: 0,
+          actualBoundingBoxRight: 0,
+          actualBoundingBoxAscent: 10,
+          actualBoundingBoxDescent: 2
+        };
+      };
+
+      P.createLinearGradient = P.createRadialGradient = function() {
+        return { addColorStop() {} };
+      };
+
+      P.createPattern = function() {
+        return null;
+      };
+
+      P.getImageData = function(x, y, w, h) {
+        return {
+          data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)),
+          width: w | 0,
+          height: h | 0
+        };
+      };
+
+      P.isPointInPath = P.isPointInStroke = function() {
+        return false;
+      };
+    };
+
+    patch();
+
+    const oldGet =
+      W.HTMLCanvasElement &&
+      W.HTMLCanvasElement.prototype &&
+      W.HTMLCanvasElement.prototype.getContext;
+
+    if (oldGet && !W.HTMLCanvasElement.prototype.__ctasNoRenderGetContext) {
+      W.HTMLCanvasElement.prototype.__ctasNoRenderGetContext = true;
+
+      W.HTMLCanvasElement.prototype.getContext = function(type, opts) {
+        const ctx = oldGet.call(this, type, opts);
+        patch();
+        return ctx;
+      };
+    }
+  }
+
+  function simStartLevel(level) {
+    try {
+      if (typeof W._k5 === "function") {
+        W._k5(gmObj(0) || {}, gmObj(0) || {}, Math.max(0, Number(level) || 0));
+      } else if (typeof W._ai === "function") {
+        W._ai(0, 0, 3);
+      }
+    } catch {}
+  }
+
+  function simTrial(script, msg) {
+    forceSeed(msg.seed || 0);
+
+    if (typeof W.__ctasPatchGameMakerAudio === "function") {
+      W.__ctasPatchGameMakerAudio();
+    }
+
+    tas.script = normalizeScript(script || []);
+    tas.playIndex = 0;
+    tas.playLastFrame = -1;
+    tas.playLevel = null;
+    tas.virtualEnabled = true;
+    tas.playbackMode = true;
+    tas.paused = false;
+
+    setVirtualInput(".");
+
+    simStartLevel(msg.level);
+
+    W.__ctasPumpMany(Math.max(0, Number(msg.warmup) || 0));
+
+    tas.playIndex = 0;
+    tas.playLastFrame = -1;
+    tas.playLevel = gmLevel();
+
+    setVirtualInput(".");
+
+    tas.lastCP = currentCP();
+    tas.cpTimes = [];
+
+    let score = Infinity;
+    let reached = false;
+
+    for (let f = 0; f < msg.maxFrames; f++) {
+      W.__ctasPumpFrame();
+
+      const cp = currentCP();
+
+      if (cp > tas.lastCP) {
+        for (let n = tas.lastCP + 1; n <= cp; n++) {
+          tas.cpTimes[n] = gameFrame();
+        }
+
+        tas.lastCP = cp;
+      }
+
+      if (msg.target === "cp" && tas.cpTimes[msg.targetCP] != null) {
+        score = tas.cpTimes[msg.targetCP];
+        reached = true;
+        break;
+      }
+
+      if (msg.target === "finish" && cp >= msg.finishCP) {
+        score = gameFrame();
+        reached = true;
+        break;
+      }
+    }
+
+    tas.playbackMode = false;
+    tas.virtualEnabled = false;
+    setVirtualInput(".");
+
+    return {
+      score,
+      reached,
+      cp: currentCP(),
+      times: tas.cpTimes.slice()
+    };
+  }
+
+  function simRunBatch(msg) {
+    try {
+      installNoAudio();
+
+      if (typeof W.__ctasPatchGameMakerAudio === "function") {
+        W.__ctasPatchGameMakerAudio();
+      }
+
+      W.__ctasTrialActive = true;
+
+      cfg.seed = Number(msg.seed) | 0;
+      cfg.targetCP = Math.max(1, Number(msg.targetCP) | 0);
+      cfg.finishCP = Math.max(1, Number(msg.finishCP) | 0);
+
+      let bestScore = Infinity;
+      let bestIndex = -1;
+      let bestReached = false;
+      let bestTimes = [];
+
+      const scripts = msg.scripts || [];
+
+      for (let i = 0; i < scripts.length; i++) {
+        const r = simTrial(scripts[i], msg);
+
+        if (r.score < bestScore) {
+          bestScore = r.score;
+          bestIndex = i;
+          bestReached = r.reached;
+          bestTimes = r.times || [];
+        }
+      }
+
+      W.__ctasTrialActive = false;
+
+      W.parent.postMessage({
+        type: "CTAS_BATCH_RESULT",
+        id: msg.id,
+        token: SIM_TOKEN,
+        trials: scripts.length,
+        bestIndex,
+        bestScore,
+        bestReached,
+        bestTimes,
+      }, "*");
+    } catch (e) {
+      W.__ctasTrialActive = false;
+
+      try {
+        W.parent.postMessage({
+          type: "CTAS_BATCH_RESULT",
+          id: msg.id,
+          token: SIM_TOKEN,
+          trials: 0,
+          bestIndex: -1,
+          bestScore: Infinity,
+          bestReached: false,
+          bestTimes: [],
+          error: String(e && e.stack || e && e.message || e)
+        }, "*");
+      } catch {}
+    }
+  }
+
+  function simInit() {
+    const wait = () => {
+      if (!coreReady()) return REAL.setTimeout(wait, 20);
+
+      installNoAudio();
+
+      if (typeof W.__ctasPatchGameMakerAudio === "function") {
+        W.__ctasPatchGameMakerAudio();
+      }
+
+      patchGameInput();
+
+      rawAdd(W, "message", ev => {
+        const d = ev.data || {};
+        if (d.type === "CTAS_RUN_BATCH") simRunBatch(d);
+      }, true);
+
+      W.parent.postMessage({
+        type: "CTAS_SIM_READY",
+        token: SIM_TOKEN
+      }, "*");
+    };
+
+    wait();
+  }
+
+  function mainInit() {
+    installEventGate();
+
+    const wait = () => {
+      if (!coreReady()) return REAL.setTimeout(wait, 100);
+      if (!isGameFrame()) return;
+
+      buildUI();
+
+      rawAdd(W, "keydown", ev => {
+        if (isUiTarget(ev.target)) return;
+
+        if (ev.keyCode === 37 || ev.keyCode === 65) tas.domHeld.L = true;
+        if (ev.keyCode === 39 || ev.keyCode === 68) tas.domHeld.R = true;
+      }, true);
+
+      rawAdd(W, "keyup", ev => {
+        if (isUiTarget(ev.target)) return;
+
+        if (ev.keyCode === 37 || ev.keyCode === 65) tas.domHeld.L = false;
+        if (ev.keyCode === 39 || ev.keyCode === 68) tas.domHeld.R = false;
+      }, true);
+
+      rawAdd(W, "blur", () => {
+        tas.domHeld.L = false;
+        tas.domHeld.R = false;
+      }, true);
+
+      patchGameInput();
+      resetCapture();
+      status("recording");
+      monitorTick();
+    };
+
+    wait();
+  }
+
+  if (IS_SIM) simInit();
+  else mainInit();
+})();
