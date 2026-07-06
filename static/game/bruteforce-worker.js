@@ -4,6 +4,13 @@
 	const W = self;
 	W.window = W;
 	W.globalThis = W;
+	const workerCacheBust = (() => {
+		try {
+			return new URLSearchParams(W.location.search).get('v') || String(Date.now());
+		} catch {
+			return String(Date.now());
+		}
+	})();
 	const realSetTimeout = W.setTimeout.bind(W);
 	const realPerformanceNow =
 		W.performance && typeof W.performance.now === 'function' ? W.performance.now.bind(W.performance) : null;
@@ -601,7 +608,7 @@
 	});
 
 	installEnvironment();
-	importScripts('/game/tas-bridge.js?v=53');
+	importScripts(`/game/tas-bridge.js?v=${encodeURIComponent(workerCacheBust)}`);
 	importScripts('/game/html5game_a5/tph_html5fixes3.js?v=1');
 	importScripts('/game/html5game_a5/uph_quickTextRender.js?v=1');
 	importScripts('/game/html5game_a5/vph_HTML5Link.js?v=1');

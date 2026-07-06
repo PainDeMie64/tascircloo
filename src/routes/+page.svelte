@@ -78,14 +78,18 @@
 	const parsedScript = $derived(normalizeScript(scriptText));
 	const lineCount = $derived(scriptText.trim() ? parsedScript.length : 0);
 	const inputLabel = $derived(`${lineCount} ${lineCount === 1 ? 'input' : 'inputs'}`);
-	const selectedTargetTime = $derived(telemetry.cpTimes[settings.targetCP] ?? null);
+	const targetCPNumber = $derived(Math.max(1, Math.floor(Number(settings.targetCP) || 1)));
+	const finishCPNumber = $derived(Math.max(1, Math.floor(Number(settings.finishCP) || 1)));
+	const scoredCPNumber = $derived(settings.target === 'cp' ? targetCPNumber : finishCPNumber);
+	const selectedTargetTime = $derived(telemetry.cpTimes[scoredCPNumber] ?? null);
+	const targetLabel = $derived(settings.target === 'cp' ? `Target CP ${targetCPNumber}` : `Finish CP ${finishCPNumber}`);
+	const bruteforceTargetLabel = $derived(settings.target === 'cp' ? `scoring CP ${targetCPNumber}` : `scoring finish CP ${finishCPNumber}`);
 	const checkpointRows = $derived(
-		Array.from({ length: Math.max(1, Math.floor(Number(settings.finishCP) || 1)) }, (_, index) => {
+		Array.from({ length: finishCPNumber }, (_, index) => {
 			const cp = index + 1;
-			const finishCP = Math.max(1, Math.floor(Number(settings.finishCP) || 1));
 			return {
 				cp,
-				label: cp === finishCP ? `CP ${cp} / Finish` : `CP ${cp}`,
+				label: cp === finishCPNumber ? `CP ${cp} / Finish` : `CP ${cp}`,
 				frame: telemetry.cpTimes[cp] ?? null
 			};
 		})
@@ -433,7 +437,7 @@
 					<strong>{telemetry.cp}</strong>
 				</div>
 				<div>
-					<span>Target {settings.targetCP}</span>
+					<span>{targetLabel}</span>
 					<strong>{gameTime(selectedTargetTime)}</strong>
 				</div>
 				<div>
@@ -499,7 +503,7 @@
 								<Info size={13} />
 							</span>
 						</span>
-						<input type="number" min="1" bind:value={settings.targetCP} onchange={saveSettings} />
+						<input type="number" min="1" bind:value={settings.targetCP} onchange={saveSettings} disabled={settings.target !== 'cp'} />
 					</label>
 					<label>
 						<span class="setting-label">
@@ -577,6 +581,7 @@
 
 				<div class="bruteforce-stats">
 					<span>{bruteforce.trials} trials</span>
+					<span>{bruteforceTargetLabel}</span>
 					<span>{bruteforceRate.toFixed(1)}/s</span>
 					<span>best {gameTime(bruteforce.bestScore)}</span>
 					<span>{bruteforce.improvements} improvements</span>
