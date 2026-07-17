@@ -8,6 +8,15 @@
 	const SIM_TOKEN = PARAMS.get('token') || '';
 	const FPS = 60;
 	const DEFAULT_GAMEPLAY_SEED = 0;
+	// GameMaker removes the previous room after the next one starts. Keep the two
+	// deterministic construction stages in separate ID ranges so old cleanup
+	// cannot clear a newly registered instance that reused the same ID.
+	const WARMUP_INSTANCE_BASE = 1000000;
+	const FINAL_INSTANCE_BASE = 2000000;
+	const WARMUP_TILE_BASE = 20000000;
+	const FINAL_TILE_BASE = 30000000;
+	const RETRY_INSTANCE_STRIDE = 100000;
+	const RETRY_TILE_STRIDE = 1000000;
 	const RealDate = W.Date;
 	const realPerformanceNow =
 		W.performance && typeof W.performance.now === 'function' ? W.performance.now.bind(W.performance) : null;
@@ -1606,13 +1615,13 @@
 		return seeded ? seed : null;
 	}
 
-	function resetGameMakerRuntimeState(resetAllocators) {
+	function resetGameMakerRuntimeState(allocatorBase = null) {
 		return !!callGlobal(
 			[
 				'if (typeof _Vm2 !== "undefined") _Vm2 = 0;',
-				'if (args[0]) {',
-				'  if (typeof _Oz2 !== "undefined") _Oz2 = 100000;',
-				'  if (typeof _Sz2 !== "undefined") _Sz2 = 10000000;',
+				'if (args[0] != null) {',
+				'  if (typeof _Oz2 !== "undefined") _Oz2 = args[0];',
+				'  if (typeof _Sz2 !== "undefined") _Sz2 = args[1];',
 				'}',
 				'if (typeof _Ux !== "undefined" && _Ux && _Ux._P41 && _Ux._P41._OH) {',
 				'  for (var i = 0; i < _Ux._P41._OH.length; i++) {',
@@ -1635,14 +1644,15 @@
 				'if (typeof _Xx !== "undefined" && _Xx && typeof _Xx._DY === "function") _Xx._DY();',
 				'return true;'
 			].join('\n'),
-			!!resetAllocators
+			allocatorBase && allocatorBase.instances,
+			allocatorBase && allocatorBase.tiles
 		);
 	}
 
-	function startLevelDirect(level) {
+	function startLevelDirect(level, allocatorBase = null) {
 		const targetLevel = Math.max(0, Math.floor(Number(level) || 0));
 		if (!canonicalGameplayEnvironmentReady()) return false;
-		if (!resetGameMakerRuntimeState(true)) return false;
+		if (!resetGameMakerRuntimeState(allocatorBase)) return false;
 		callGlobal('if (typeof _X32 === "function") _X32(); return true;');
 		W._c4({}, {}, targetLevel);
 		return true;
@@ -1727,7 +1737,12 @@
 		resetDeterministicClock();
 		try {
 			const previousPlayer = gmPlayer();
-			if (!startLevelDirect(state.activeRun.level)) {
+			if (
+				!startLevelDirect(state.activeRun.level, {
+					instances: WARMUP_INSTANCE_BASE,
+					tiles: WARMUP_TILE_BASE
+				})
+			) {
 				if (!canonicalGameplayEnvironmentReady()) deferCanonicalRunUntilGameplay(state.activeRun);
 				else failCanonicalRun('Unable to initialize the deterministic gameplay state');
 				return;
@@ -1806,7 +1821,12 @@
 				resetDeterministicClock();
 				try {
 					const previousPlayer = gmPlayer();
-					if (!startLevelDirect(run.level)) {
+					if (
+						!startLevelDirect(run.level, {
+							instances: FINAL_INSTANCE_BASE,
+							tiles: FINAL_TILE_BASE
+						})
+					) {
 						if (!canonicalGameplayEnvironmentReady()) deferCanonicalRunUntilGameplay(run);
 						else failCanonicalRun('Unable to construct the canonical gameplay state');
 						return;
@@ -1827,7 +1847,7 @@
 			return;
 		}
 
-		if (!resetGameMakerRuntimeState(false)) {
+		if (!resetGameMakerRuntimeState()) {
 			failCanonicalRun('Unable to canonicalize the tick-zero runtime state');
 			return;
 		}
@@ -1841,10 +1861,10 @@
 		});
 	}
 
-	function tryStartLevel(level) {
+	function tryStartLevel(level, allocatorBase = null) {
 		resetRunLog('start-level');
 		ensureSimPlayRoom();
-		return startLevelDirect(level);
+		return startLevelDirect(level, allocatorBase);
 	}
 
 	function installNoAudio() {
@@ -2027,14 +2047,23 @@
 			state.unfreezeSource = 'sim-prep';
 		}
 
+		function stageAllocator(instances, tiles, attempt) {
+			return {
+				instances: instances + attempt * RETRY_INSTANCE_STRIDE,
+				tiles: tiles + attempt * RETRY_TILE_STRIDE
+			};
+		}
+
+		let prepAttempt = 0;
 		seedGameplay(seed);
-		tryStartLevel(targetLevel);
+		tryStartLevel(targetLevel, stageAllocator(WARMUP_INSTANCE_BASE, WARMUP_TILE_BASE, prepAttempt));
 		allowPrepPump();
 		for (let i = 0; i < 180 && !freshLevelReady(); i++) {
 			if (i > 0 && i % 30 === 0) {
 				stageStartPlayer = gmPlayer();
 				seedGameplay(seed);
-				tryStartLevel(targetLevel);
+				prepAttempt++;
+				tryStartLevel(targetLevel, stageAllocator(WARMUP_INSTANCE_BASE, WARMUP_TILE_BASE, prepAttempt));
 			}
 			W.__circlooTasPumpFrame();
 			debug.prepPumps++;
@@ -2042,14 +2071,16 @@
 		}
 
 		stageStartPlayer = gmPlayer();
+		let restartAttempt = 0;
 		seedGameplay(seed);
-		tryStartLevel(targetLevel);
+		tryStartLevel(targetLevel, stageAllocator(FINAL_INSTANCE_BASE, FINAL_TILE_BASE, restartAttempt));
 		allowPrepPump();
 		for (let i = 0; i < 180 && !freshLevelReady(); i++) {
 			if (i > 0 && i % 30 === 0) {
 				stageStartPlayer = gmPlayer();
 				seedGameplay(seed);
-				tryStartLevel(targetLevel);
+				restartAttempt++;
+				tryStartLevel(targetLevel, stageAllocator(FINAL_INSTANCE_BASE, FINAL_TILE_BASE, restartAttempt));
 			}
 			W.__circlooTasPumpFrame();
 			debug.restartPumps++;
