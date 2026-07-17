@@ -38,7 +38,6 @@
 	const LEFT_CODES = new Set([37, 65]);
 	const RIGHT_CODES = new Set([39, 68]);
 	const UNFREEZE_CODES = new Set([85]);
-	const NATIVE_RETRY_CODE = 82;
 	const RUN_LOG_LIMIT = 20000;
 
 	const state = {
@@ -49,7 +48,6 @@
 		originalPokiInputPressed: null,
 		originalCollectCircle: null,
 		originalPlayerCreate: null,
-		originalPauseMenuAction: null,
 		virtualEnabled: false,
 		playbackMode: false,
 		paused: false,
@@ -105,11 +103,8 @@
 		clockTick: 0,
 		pendingRun: null,
 		activeRun: null,
-		lastCanonicalRun: null,
 		canonicalStage: 'idle',
-		runRequestSequence: 0,
-		nativeRetryHeld: false,
-		nativeRetryQueued: false
+		runRequestSequence: 0
 	};
 	let canonicalRetryTimer = null;
 
@@ -1188,107 +1183,6 @@
 		return value;
 	}
 
-	function ownsNativeRetry() {
-		if (IS_SIM) return false;
-		if (state.activeRun || state.pendingRun) return true;
-		return state.playbackMode && !!state.lastCanonicalRun;
-	}
-
-	function canonicalRetrySnapshot() {
-		const run = state.lastCanonicalRun;
-		if (!run || !Array.isArray(run.script)) return null;
-		const currentLevel = currentGameplayLevel();
-		const level = currentLevel === null ? run.level : currentLevel;
-		if (!Number.isFinite(Number(level))) return null;
-		return {
-			level: Math.max(0, Math.floor(Number(level) || 0)),
-			seed: Number.isFinite(Number(run.seed)) ? Math.trunc(Number(run.seed)) | 0 : DEFAULT_GAMEPLAY_SEED,
-			exact: !!run.exact,
-			script: run.script.map((entry) => ({ ...entry }))
-		};
-	}
-
-	function queueCanonicalRetry(source = 'native-retry') {
-		if (!ownsNativeRetry()) return false;
-		if (state.nativeRetryQueued || state.activeRun || state.pendingRun) return true;
-
-		const snapshot = canonicalRetrySnapshot();
-		if (!snapshot) return false;
-
-		state.nativeRetryQueued = true;
-		REAL.setTimeout(() => {
-			if (!state.nativeRetryQueued) return;
-			state.nativeRetryQueued = false;
-			if (state.activeRun || state.pendingRun) return;
-			const retry = canonicalRetrySnapshot() || snapshot;
-			requestCanonicalReplay(retry.script, {
-				level: retry.level,
-				seed: retry.seed,
-				exact: retry.exact,
-				source
-			});
-		}, 0);
-		return true;
-	}
-
-	function startCanonicalRetry(source = 'native-retry') {
-		if (!ownsNativeRetry() || state.activeRun || state.pendingRun) return false;
-		const retry = canonicalRetrySnapshot();
-		if (!retry) return false;
-		state.nativeRetryQueued = false;
-		requestCanonicalReplay(retry.script, {
-			level: retry.level,
-			seed: retry.seed,
-			exact: retry.exact,
-			source
-		});
-		return true;
-	}
-
-	function interceptNativeRetryInput(code, value) {
-		if (Number(code) !== NATIVE_RETRY_CODE) return null;
-		const held = Number(value) > 0.5;
-		if (!ownsNativeRetry()) {
-			if (!held) state.nativeRetryHeld = false;
-			return null;
-		}
-
-		if (!held) {
-			state.nativeRetryHeld = false;
-			return 0;
-		}
-		if (!state.nativeRetryHeld) {
-			state.nativeRetryHeld = true;
-			queueCanonicalRetry('keyboard-r');
-		}
-		return 0;
-	}
-
-	function patchRetryActions() {
-		if (state.originalPauseMenuAction) return true;
-		if (typeof W._o4 !== 'function') return false;
-
-		state.originalPauseMenuAction = W._o4;
-		W._o4 = function patchedPauseMenuAction(self, other, choice) {
-			if (Number(choice) === 1 && ownsNativeRetry()) {
-				const retry = canonicalRetrySnapshot();
-				if (!retry) return 0;
-				callGlobal(
-					'if (typeof global !== "undefined" && global) {' +
-						' if (!(global._nc > 0.5)) {' +
-						'  global._mc = 0;' +
-						'  if (typeof _Pl === "function") _Pl(0);' +
-						' }' +
-						'} return true;'
-				);
-				startCanonicalRetry('pause-menu');
-				return 0;
-			}
-			return state.originalPauseMenuAction.apply(this, arguments);
-		};
-		return true;
-	}
-
 	function inputCheckGroupDone(code, value) {
 		const numeric = Number(code);
 		const pressed = Number(value) > 0.5;
@@ -1405,8 +1299,6 @@
 			W[inputCheckName] = function patchedInputCheck(self, other, code) {
 				if (shouldUseVirtualInput.call(this, self, code)) return virtualCheck(code);
 				const nativeValue = state.originalInputCheck.apply(this, arguments);
-				const retryValue = interceptNativeRetryInput(code, nativeValue);
-				if (retryValue !== null) return retryValue;
 				const gatedNativeValue = gatedNativeInput.call(this, self, code, nativeValue);
 				captureInputCheck.call(this, self, code, gatedNativeValue);
 				return gatedNativeValue;
@@ -1418,8 +1310,6 @@
 			W[inputPressedName] = function patchedInputPressed(self, other, code) {
 				if (shouldUseVirtualInput.call(this, self, code)) return virtualPressed(code);
 				const nativeValue = state.originalInputPressed.apply(this, arguments);
-				const retryValue = interceptNativeRetryInput(code, nativeValue);
-				if (retryValue !== null) return retryValue;
 				return gatedNativeInput.call(this, self, code, nativeValue);
 			};
 		}
@@ -1429,8 +1319,6 @@
 			W._R4 = function patchedPokiInputCheck(self, other, code) {
 				if (shouldUseVirtualInput.call(this, self, code)) return virtualCheck(code);
 				const nativeValue = state.originalPokiInputCheck.apply(this, arguments);
-				const retryValue = interceptNativeRetryInput(code, nativeValue);
-				if (retryValue !== null) return retryValue;
 				const gatedNativeValue = gatedNativeInput.call(this, self, code, nativeValue);
 				captureInputCheck.call(this, self, code, gatedNativeValue);
 				return gatedNativeValue;
@@ -1442,8 +1330,6 @@
 			W._S4 = function patchedPokiInputPressed(self, other, code) {
 				if (shouldUseVirtualInput.call(this, self, code)) return virtualPressed(code);
 				const nativeValue = state.originalPokiInputPressed.apply(this, arguments);
-				const retryValue = interceptNativeRetryInput(code, nativeValue);
-				if (retryValue !== null) return retryValue;
 				return gatedNativeInput.call(this, self, code, nativeValue);
 			};
 		}
@@ -1578,7 +1464,6 @@
 		const inputPatched = patchInput();
 		patchCollectCircle();
 		patchPlayerCreate();
-		patchRetryActions();
 		patchRoomFreezeHooks();
 		return inputPatched;
 	}
@@ -1869,7 +1754,6 @@
 	}
 
 	function requestCanonicalReplay(script, options = {}) {
-		state.nativeRetryQueued = false;
 		const normalized = normalizeScript(script, options);
 		const requestId = Number.isFinite(Number(options.requestId))
 			? Math.trunc(Number(options.requestId))
@@ -1889,8 +1773,6 @@
 
 	function cancelCanonicalReplay() {
 		clearCanonicalRetry();
-		state.nativeRetryQueued = false;
-		state.nativeRetryHeld = false;
 		state.pendingRun = null;
 		state.activeRun = null;
 		state.canonicalStage = 'idle';
@@ -1969,12 +1851,6 @@
 			failCanonicalRun('Unable to canonicalize the tick-zero runtime state');
 			return;
 		}
-		state.lastCanonicalRun = {
-			level: run.level,
-			seed: run.seed,
-			exact: run.exact,
-			script: run.script.map((entry) => ({ ...entry }))
-		};
 		armReplay(run.script, { exact: run.exact });
 		state.activeRun = null;
 		state.canonicalStage = 'running';
@@ -2371,20 +2247,6 @@
 
 		function keyDown(event) {
 			if (shouldIgnoreKeyEvent(event)) return;
-			const retryKey =
-				Number(event.keyCode || event.which) === NATIVE_RETRY_CODE ||
-				event.code === 'KeyR' ||
-				String(event.key || '').toLowerCase() === 'r';
-			if (retryKey && ownsNativeRetry()) {
-				if (!state.nativeRetryHeld) {
-					state.nativeRetryHeld = true;
-					queueCanonicalRetry('keyboard-r');
-				}
-				event.preventDefault?.();
-				event.stopImmediatePropagation?.();
-				event.stopPropagation?.();
-				return;
-			}
 			if (UNFREEZE_CODES.has(event.keyCode)) {
 				if (requestManualUnfreeze()) {
 					event.preventDefault?.();
@@ -2398,17 +2260,6 @@
 
 		function keyUp(event) {
 			if (shouldIgnoreKeyEvent(event)) return;
-			const retryKey =
-				Number(event.keyCode || event.which) === NATIVE_RETRY_CODE ||
-				event.code === 'KeyR' ||
-				String(event.key || '').toLowerCase() === 'r';
-			if (retryKey && (ownsNativeRetry() || state.nativeRetryHeld)) {
-				state.nativeRetryHeld = false;
-				event.preventDefault?.();
-				event.stopImmediatePropagation?.();
-				event.stopPropagation?.();
-				return;
-			}
 			if (UNFREEZE_CODES.has(event.keyCode)) return;
 			if (LEFT_CODES.has(event.keyCode)) state.domHeld.L = false;
 			if (RIGHT_CODES.has(event.keyCode)) state.domHeld.R = false;
@@ -2474,7 +2325,6 @@
 			() => {
 				state.domHeld.L = false;
 				state.domHeld.R = false;
-				state.nativeRetryHeld = false;
 			},
 			true
 		);
