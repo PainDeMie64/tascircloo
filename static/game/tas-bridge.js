@@ -40,8 +40,8 @@
 		originalCollectCircle: null,
 		originalPlayerCreate: null,
 		originalSplitSave: null,
-		splitSaveTimer: null,
 		splitSaveArgs: null,
+		splitSaveLifecycleBound: false,
 		virtualEnabled: false,
 		playbackMode: false,
 		paused: false,
@@ -1363,7 +1363,6 @@
 	}
 
 	function flushSplitSave() {
-		state.splitSaveTimer = null;
 		const args = state.splitSaveArgs;
 		state.splitSaveArgs = null;
 		if (!state.originalSplitSave || !args) return;
@@ -1374,16 +1373,26 @@
 		}
 	}
 
+	function maybeFlushSplitSave() {
+		if (!state.splitSaveArgs) return;
+		if (freezeApplies() && hasPlayer() && !state.physicsFrozen) return;
+		flushSplitSave();
+	}
+
 	function patchSplitSave() {
 		if (IS_SIM || state.originalSplitSave) return true;
 		if (typeof W._R6 !== 'function') return false;
 		state.originalSplitSave = W._R6;
 		W._R6 = function (...args) {
 			state.splitSaveArgs = args;
-			if (state.splitSaveTimer === null) {
-				state.splitSaveTimer = REAL.setTimeout(flushSplitSave, 0);
-			}
 		};
+		if (!state.splitSaveLifecycleBound) {
+			state.splitSaveLifecycleBound = true;
+			W.addEventListener('pagehide', flushSplitSave, true);
+			D.addEventListener('visibilitychange', () => {
+				if (D.visibilityState === 'hidden') flushSplitSave();
+			});
+		}
 		return true;
 	}
 
@@ -1392,6 +1401,7 @@
 
 		state.originalPlayerCreate = W._P8;
 		W._P8 = function patchedPlayerCreate(self, other) {
+			flushSplitSave();
 			const result = state.originalPlayerCreate.apply(this, arguments);
 			beginFreshRun('player-create');
 			resetCapture({ preserve: false });
@@ -1734,6 +1744,7 @@
 			return;
 		}
 		clearCanonicalRetry();
+		flushSplitSave();
 		state.activeRun = state.pendingRun;
 		state.pendingRun = null;
 		if (state.activeRun.followCurrentLevel) {
@@ -1786,6 +1797,7 @@
 	}
 
 	function cancelCanonicalReplay() {
+		flushSplitSave();
 		clearCanonicalRetry();
 		state.pendingRun = null;
 		state.activeRun = null;
@@ -1871,6 +1883,7 @@
 	}
 
 	function tryStartLevel(level) {
+		flushSplitSave();
 		resetRunLog('start-level');
 		ensureSimPlayRoom();
 		return startLevelDirect(level);
@@ -2163,6 +2176,7 @@
 	function monitorTick() {
 		state.wallFrame++;
 		patchGameHooks();
+		maybeFlushSplitSave();
 		updateCheckpointTracking();
 		updateVelocity();
 		updateFreezeHint();
