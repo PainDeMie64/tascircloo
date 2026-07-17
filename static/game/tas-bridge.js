@@ -39,9 +39,6 @@
 		originalPokiInputPressed: null,
 		originalCollectCircle: null,
 		originalPlayerCreate: null,
-		originalSplitSave: null,
-		splitSaveTimer: null,
-		splitSaveArgs: null,
 		virtualEnabled: false,
 		playbackMode: false,
 		paused: false,
@@ -1362,31 +1359,6 @@
 		return true;
 	}
 
-	function flushSplitSave() {
-		state.splitSaveTimer = null;
-		const args = state.splitSaveArgs;
-		state.splitSaveArgs = null;
-		if (!state.originalSplitSave || !args) return;
-		try {
-			state.originalSplitSave.apply(W, args);
-		} catch (error) {
-			console.warn('[circloo-tas] Unable to persist checkpoint splits', error);
-		}
-	}
-
-	function patchSplitSave() {
-		if (IS_SIM || state.originalSplitSave) return true;
-		if (typeof W._R6 !== 'function') return false;
-		state.originalSplitSave = W._R6;
-		W._R6 = function (...args) {
-			state.splitSaveArgs = args;
-			if (state.splitSaveTimer === null) {
-				state.splitSaveTimer = REAL.setTimeout(flushSplitSave, 0);
-			}
-		};
-		return true;
-	}
-
 	function patchPlayerCreate() {
 		if (state.originalPlayerCreate || typeof W._P8 !== 'function') return !!state.originalPlayerCreate;
 
@@ -1482,7 +1454,6 @@
 	function patchGameHooks() {
 		const inputPatched = patchInput();
 		patchCollectCircle();
-		patchSplitSave();
 		patchPlayerCreate();
 		patchRoomFreezeHooks();
 		return inputPatched;
