@@ -7,6 +7,34 @@ export type ScriptEntry = {
 
 const validInputs = new Set<TasInput>(['.', 'L', 'R', 'LR', 'U']);
 
+export function validateNormalizedScript(value: unknown): ScriptEntry[] | null {
+	if (!Array.isArray(value)) return null;
+
+	const entries: ScriptEntry[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== 'object') return null;
+		const frame = (item as { frame?: unknown }).frame;
+		const input = (item as { input?: unknown }).input;
+		if (!Number.isInteger(frame) || typeof input !== 'string' || !validInputs.has(input as TasInput)) {
+			return null;
+		}
+		if ((input === 'U' && Number(frame) > 0) || (input !== 'U' && Number(frame) < 0)) return null;
+		entries.push({ frame: Number(frame), input: input as TasInput });
+	}
+
+	const normalized = normalizeScript(entries);
+	if (
+		normalized.length !== entries.length ||
+		normalized.some(
+			(entry, index) => entry.frame !== entries[index].frame || entry.input !== entries[index].input
+		)
+	) {
+		return null;
+	}
+
+	return normalized;
+}
+
 export function inputFromHeld(held: { L: boolean; R: boolean }): TasInput {
 	if (held.L && held.R) return 'LR';
 	if (held.L) return 'L';

@@ -501,12 +501,24 @@
 	}
 
 	function trialOptions() {
+		const pointMaxFrame = Math.max(
+			0,
+			finiteFrame(current.settings.pointMaxFrame, finiteFrame(current.settings.maxFrames, 1) - 1)
+		);
 		return {
 			level: current.level,
 			target: current.settings.target,
 			targetCP: current.settings.targetCP,
 			finishCP: current.settings.finishCP,
-			maxFrames: current.settings.maxFrames,
+			pointX: current.settings.pointX,
+			pointY: current.settings.pointY,
+			pointZ: current.settings.pointZ,
+			pointMinFrame: current.settings.pointMinFrame,
+			pointMaxFrame,
+			maxFrames:
+				current.settings.target === 'point'
+					? Math.max(finiteFrame(current.settings.maxFrames, 1), pointMaxFrame + 1)
+					: current.settings.maxFrames,
 			warmup: current.settings.warmup,
 			seed: 0
 		};
@@ -676,6 +688,9 @@
 	}
 
 	async function createWasmSearchOptimizer(base, options, settings) {
+		if (options && options.target === 'point') {
+			return { optimizer: null, reason: 'point-target-full-runtime' };
+		}
 		if (typeof W.__circlooTasCaptureWasmRuntimeModel !== 'function') {
 			return { optimizer: null, reason: 'wasm-unavailable' };
 		}
@@ -907,20 +922,22 @@
 				fastSignature === null ||
 				finalStateMatches(fastResult, exactResult);
 			if (!resultMatches || !stateMatches || !signatureMatches) {
+				const mismatchType = resultMatches
+					? signatureMatches
+						? 'state-mismatch'
+						: 'wasm-final-state-mismatch'
+					: 'score-mismatch';
+				console.warn('[Circloo TAS] Optimizer validation failed', mismatchType, {
+					candidate,
+					fast,
+					exact,
+					fastFinalState: fastResult.debug && fastResult.debug.finalState,
+					exactFinalState: exactResult.debug && exactResult.debug.finalState
+				});
 				return {
 					optimizer: null,
 					validated: false,
-					reason: resultMatches
-						? signatureMatches
-							? 'state-mismatch'
-							: `wasm-final-state-mismatch:${JSON.stringify({
-								candidate,
-								fast: fastResult.debug && fastResult.debug.finalState,
-								exact: exactResult.debug && exactResult.debug.finalState,
-								fastTimes: fastResult.times,
-								exactTimes: exactResult.times
-							})}`
-						: `score-mismatch:${JSON.stringify({ candidate, fast, exact })}`
+					reason: mismatchType
 				};
 			}
 		}
@@ -930,6 +947,7 @@
 		return { optimizer, validated: true, reason: '' };
 	}
 	function createSearchOptimizer(base, options, settings) {
+		if (options && options.target === 'point') return null;
 		const finishSeven =
 			typeof W.__circlooTasCreateFinishSevenOptimizer === 'function'
 				? W.__circlooTasCreateFinishSevenOptimizer(base, options)
@@ -1161,35 +1179,6 @@
 		}
 	}
 
-	function emptyDebugStats() {
-		return {
-			workerMs: 0,
-			mutateMs: 0,
-			trialMs: 0,
-			prepareMs: 0,
-			pumpMs: 0,
-			frames: 0,
-			prepPumps: 0
-		};
-	}
-
-	function recordDebug(sample) {
-		if (!current.debugTotals) current.debugTotals = emptyDebugStats();
-		current.debugCount = (current.debugCount || 0) + 1;
-		for (const key of Object.keys(current.debugTotals)) current.debugTotals[key] += Number(sample[key]) || 0;
-		current.debugLast = sample;
-	}
-
-	function debugPayload() {
-		const count = Math.max(1, current.debugCount || 0);
-		const avg = emptyDebugStats();
-		for (const key of Object.keys(avg)) avg[key] = ((current.debugTotals && current.debugTotals[key]) || 0) / count;
-		return {
-			last: current.debugLast || emptyDebugStats(),
-			avg
-		};
-	}
-
 	function postProgress(lastResult, force = false) {
 		const now = realNow();
 		if (!force && now - current.lastProgressAt < PROGRESS_INTERVAL_MS) return;
@@ -1205,10 +1194,7 @@
 			bestScript: current.best,
 			lastScore: lastResult.score,
 			lastReached: lastResult.reached,
-			lastScript: current.lastScript,
-			lastDebug: lastResult.debug,
 			improvements: current.improvements,
-			debug: debugPayload(),
 			rate: current.trials / elapsedSeconds,
 			mode: current.optimizer
 				? current.optimizer.mode || 'deterministic-rewind'
@@ -1226,8 +1212,6 @@
 
 	function runOne() {
 		if (!running || !current) return;
-		const workerStart = realNow();
-		const mutateStart = realNow();
 		const candidate = mutateScript(
 			current.best,
 			Math.max(0, current.settings.mutRange),
@@ -1235,11 +1219,7 @@
 			current.searchSettings,
 			nextRandom
 		);
-		const mutateMs = realNow() - mutateStart;
-		const trialStart = realNow();
 		let result = current.optimizer ? current.optimizer.evaluate(candidate) : trial(candidate);
-		const trialMs = realNow() - trialStart;
-		current.lastScript = candidate;
 		current.trials += 1;
 
 		if (result.reached && result.score < current.bestScore) {
@@ -1272,15 +1252,6 @@
 			}
 		}
 
-		recordDebug({
-			workerMs: realNow() - workerStart,
-			mutateMs,
-			trialMs,
-			prepareMs: result.debug && result.debug.prepareMs,
-			pumpMs: result.debug && result.debug.pumpMs,
-			frames: result.debug && result.debug.frames,
-			prepPumps: result.debug && result.debug.prepPumps
-		});
 		if (current.maxTrials && current.trials >= current.maxTrials) {
 			postProgress(result, true);
 			running = false;
@@ -1315,12 +1286,24 @@
 			const requestedLevel = Number(message.level);
 			const settings = message.settings || {};
 			const level = Number.isFinite(requestedLevel) ? Math.max(0, requestedLevel) : 1;
+			const pointMaxFrame = Math.max(
+				0,
+				finiteFrame(settings.pointMaxFrame, finiteFrame(settings.maxFrames, 1) - 1)
+			);
 			const options = {
 				level,
 				target: settings.target,
 				targetCP: settings.targetCP,
 				finishCP: settings.finishCP,
-				maxFrames: settings.maxFrames,
+				pointX: settings.pointX,
+				pointY: settings.pointY,
+				pointZ: settings.pointZ,
+				pointMinFrame: settings.pointMinFrame,
+				pointMaxFrame,
+				maxFrames:
+					settings.target === 'point'
+						? Math.max(finiteFrame(settings.maxFrames, 1), pointMaxFrame + 1)
+						: settings.maxFrames,
 				warmup: settings.warmup,
 				seed: 0,
 				minFrame: settings.minFrame,
@@ -1329,9 +1312,7 @@
 			};
 			const workerId = Math.max(0, finiteFrame(message.workerId, 0));
 			const startedAt = realNow();
-			const baseTrialStart = realNow();
 			const baseResult = runLocalTrial(base, options);
-			const baseTrialMs = realNow() - baseTrialStart;
 			let optimizerCheck;
 			let wasmFallbackReason = '';
 			if (message.forceFullRuntime) {
@@ -1371,9 +1352,6 @@
 				bestTimes: [],
 				trials: 0,
 				improvements: 0,
-				debugLast: emptyDebugStats(),
-				debugTotals: emptyDebugStats(),
-				debugCount: 0,
 				rngState: mixedWorkerSeed(scriptSeed(base), workerId),
 				verified: 0,
 				startedAt,
@@ -1381,19 +1359,8 @@
 				maxTrials: Math.max(0, finiteFrame(message.maxTrials, 0))
 			};
 			running = true;
-			const workerStart = realNow();
 			const result = baseResult;
 			if (!running || !current) return;
-			current.lastScript = base;
-			recordDebug({
-				workerMs: realNow() - workerStart,
-				mutateMs: 0,
-				trialMs: baseTrialMs,
-				prepareMs: result.debug && result.debug.prepareMs,
-				pumpMs: result.debug && result.debug.pumpMs,
-				frames: result.debug && result.debug.frames,
-				prepPumps: result.debug && result.debug.prepPumps
-			});
 			current.trials = 1;
 			current.verified = 1;
 			if (result.reached) {

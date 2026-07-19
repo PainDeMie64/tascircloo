@@ -47,23 +47,7 @@ export type BruteforceProgress = {
 	optimizerValidated: boolean;
 	optimizerFallbackReason: string;
 	verified: number;
-	debug?: BruteforceDebug;
 	error?: string;
-};
-
-export type BruteforceDebugStats = {
-	workerMs: number;
-	mutateMs: number;
-	trialMs: number;
-	prepareMs: number;
-	pumpMs: number;
-	frames: number;
-	prepPumps: number;
-};
-
-export type BruteforceDebug = {
-	last: BruteforceDebugStats;
-	avg: BruteforceDebugStats;
 };
 
 export type GameMessage =
@@ -88,6 +72,13 @@ export type GameMessage =
 				frames: number;
 		  }
 	| { type: 'CAPTURE_CLEARED'; source: 'circloo-tas-game' }
+	| {
+			type: 'POINT_TARGET_PICKED';
+			source: 'circloo-tas-game';
+			x: number;
+			y: number;
+			z: number;
+	  }
 	| { type: 'ERROR'; source: 'circloo-tas-game'; message: string; requestId?: number | null };
 
 export type BruteforceWorkerMessage =
@@ -96,13 +87,18 @@ export type BruteforceWorkerMessage =
 	| { type: 'BRUTEFORCE_STOPPED'; source: 'circloo-tas-worker' }
 	| { type: 'BRUTEFORCE_ERROR'; source: 'circloo-tas-worker'; error: string };
 
-export type TargetMode = 'cp' | 'finish';
+export type TargetMode = 'cp' | 'finish' | 'point';
 
 export type BruteforceSettings = {
 	level: number;
 	target: TargetMode;
 	targetCP: number;
 	finishCP: number;
+	pointX: number;
+	pointY: number;
+	pointZ: number;
+	pointMinFrame: number;
+	pointMaxFrame: number;
 	maxFrames: number;
 	minFrame: number;
 	maxFrame: number;

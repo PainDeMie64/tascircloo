@@ -104,7 +104,9 @@
 		pendingRun: null,
 		activeRun: null,
 		canonicalStage: 'idle',
-		runRequestSequence: 0
+		runRequestSequence: 0,
+		pointTarget: { enabled: false, picking: false, x: 0, y: 0, z: 0 },
+		pointMarker: null
 	};
 	let canonicalRetryTimer = null;
 
@@ -664,6 +666,148 @@
 		const hint = ensureFreezeHint();
 		if (!hint) return;
 		hint.style.display = freezeApplies() && !state.unfreezeStarted ? 'block' : 'none';
+	}
+
+	function viewTransform() {
+		const builtIn = callGlobal('return typeof _cd !== "undefined" ? _cd : null;');
+		if (!builtIn) return null;
+		const index = Math.max(0, Math.floor(Number(builtIn._BC2) || 0));
+		const numberAt = (value, fallback = 0) => {
+			const candidate = Array.isArray(value) ? Number(value[index]) : Number(value);
+			return Number.isFinite(candidate) ? candidate : fallback;
+		};
+		const viewWidth = numberAt(builtIn._9f);
+		const viewHeight = numberAt(builtIn._af);
+		const portWidth = numberAt(builtIn._df);
+		const portHeight = numberAt(builtIn._ef);
+		if (viewWidth <= 0 || viewHeight <= 0 || portWidth <= 0 || portHeight <= 0) return null;
+		return {
+			viewX: numberAt(builtIn._Hf),
+			viewY: numberAt(builtIn._Jf),
+			viewWidth,
+			viewHeight,
+			portX: numberAt(builtIn._1J2),
+			portY: numberAt(builtIn._2J2),
+			portWidth,
+			portHeight
+		};
+	}
+
+	function ensurePointMarker() {
+		if (IS_SIM) return null;
+		if (state.pointMarker?.isConnected) return state.pointMarker;
+		const marker = D.createElement('div');
+		marker.id = 'circloo-tas-point-target';
+		marker.setAttribute('aria-label', 'Bruteforce point target');
+		Object.assign(marker.style, {
+			position: 'fixed',
+			left: '0',
+			top: '0',
+			width: '18px',
+			height: '18px',
+			transform: 'translate(-50%, -50%)',
+			borderRadius: '999px',
+			background: '#ff2323',
+			border: '2px solid #ffffff',
+			boxShadow: '0 0 0 2px rgba(0,0,0,0.8), 0 0 14px 5px rgba(255,35,35,0.85)',
+			zIndex: '100001',
+			pointerEvents: 'none',
+			display: 'none'
+		});
+		D.body.appendChild(marker);
+		state.pointMarker = marker;
+		return marker;
+	}
+
+	function updatePointMarker() {
+		if (!state.pointTarget.enabled && !state.pointMarker) return;
+		const marker = ensurePointMarker();
+		if (!marker) return;
+		if (!state.pointTarget.enabled) {
+			marker.style.display = 'none';
+			return;
+		}
+		const canvas = D.getElementById('canvas');
+		const transform = viewTransform();
+		if (!canvas || !transform) {
+			marker.style.display = 'none';
+			return;
+		}
+		const rect = canvas.getBoundingClientRect();
+		if (!rect.width || !rect.height) {
+			marker.style.display = 'none';
+			return;
+		}
+		const canvasX =
+			transform.portX +
+			((state.pointTarget.x - transform.viewX) / transform.viewWidth) * transform.portWidth;
+		const canvasY =
+			transform.portY +
+			((state.pointTarget.y - transform.viewY) / transform.viewHeight) * transform.portHeight;
+		const visible =
+			canvasX >= transform.portX &&
+			canvasX <= transform.portX + transform.portWidth &&
+			canvasY >= transform.portY &&
+			canvasY <= transform.portY + transform.portHeight;
+		marker.style.display = visible ? 'block' : 'none';
+		if (!visible) return;
+		marker.style.left = `${rect.left + (canvasX / canvas.width) * rect.width}px`;
+		marker.style.top = `${rect.top + (canvasY / canvas.height) * rect.height}px`;
+	}
+
+	function setPointTarget(message) {
+		state.pointTarget.enabled = !!message.enabled;
+		state.pointTarget.picking = !!message.picking && state.pointTarget.enabled;
+		for (const key of ['x', 'y', 'z']) {
+			const value = Number(message[key]);
+			if (Number.isFinite(value)) state.pointTarget[key] = value;
+		}
+		const canvas = D.getElementById('canvas');
+		if (canvas) canvas.style.cursor = state.pointTarget.picking ? 'crosshair' : '';
+		updatePointMarker();
+	}
+
+	function pointFromPointer(event) {
+		const canvas = D.getElementById('canvas');
+		const transform = viewTransform();
+		if (!canvas || !transform) return null;
+		const rect = canvas.getBoundingClientRect();
+		if (!rect.width || !rect.height) return null;
+		const canvasX = ((event.clientX - rect.left) / rect.width) * canvas.width;
+		const canvasY = ((event.clientY - rect.top) / rect.height) * canvas.height;
+		if (
+			canvasX < transform.portX ||
+			canvasX > transform.portX + transform.portWidth ||
+			canvasY < transform.portY ||
+			canvasY > transform.portY + transform.portHeight
+		) {
+			return null;
+		}
+		return {
+			x: transform.viewX + ((canvasX - transform.portX) / transform.portWidth) * transform.viewWidth,
+			y: transform.viewY + ((canvasY - transform.portY) / transform.portHeight) * transform.viewHeight,
+			z: 0
+		};
+	}
+
+	function installPointPicker() {
+		if (IS_SIM) return;
+		const canvas = D.getElementById('canvas');
+		if (!canvas || canvas.__circlooTasPointPickerInstalled) return;
+		canvas.__circlooTasPointPickerInstalled = true;
+		canvas.addEventListener(
+			'pointerdown',
+			(event) => {
+				if (!state.pointTarget.picking) return;
+				const point = pointFromPointer(event);
+				if (!point) return;
+				event.preventDefault();
+				event.stopImmediatePropagation();
+				setPointTarget({ enabled: true, picking: false, ...point });
+				post('POINT_TARGET_PICKED', point);
+			},
+			true
+		);
 	}
 
 	function physicsWrapper() {
@@ -3983,14 +4127,46 @@
 
 			const targetCP = Math.max(1, Math.floor(Number(options.targetCP) || 1));
 			const finishCP = Math.max(1, Math.floor(Number(options.finishCP) || 1));
+			const pointX = Number.isFinite(Number(options.pointX)) ? Number(options.pointX) : 0;
+			const pointY = Number.isFinite(Number(options.pointY)) ? Number(options.pointY) : 0;
+			const pointZ = Number.isFinite(Number(options.pointZ)) ? Number(options.pointZ) : 0;
+			const pointMinFrame = Math.max(0, Math.floor(Number(options.pointMinFrame) || 0));
+			const pointMaxFrame = Math.max(
+				pointMinFrame,
+				Math.floor(Number(options.pointMaxFrame) || pointMinFrame)
+			);
+			const configuredMaxFrames = Math.max(1, Math.floor(Number(options.maxFrames) || 1));
+			const simulationLimit =
+				options.target === 'point' ? Math.max(configuredMaxFrames, pointMaxFrame + 1) : configuredMaxFrames;
 			let score = Infinity;
 			let reached = false;
 			let frames = 0;
+			let bestPointFrame = null;
+			let bestPointPosition = null;
+			const samplePoint = () => {
+				if (options.target !== 'point') return;
+				const frame = gameFrame();
+				if (frame < pointMinFrame || frame > pointMaxFrame) return;
+				const player = gmPlayer();
+				const x = Number(player && player.x);
+				const y = Number(player && player.y);
+				if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+				const distance = Math.hypot(x - pointX, y - pointY, pointZ);
+				if (!Number.isFinite(distance)) return;
+				reached = true;
+				if (distance < score || (distance === score && (bestPointFrame === null || frame < bestPointFrame))) {
+					score = distance;
+					bestPointFrame = frame;
+					bestPointPosition = { x, y, z: 0 };
+				}
+			};
+			samplePoint();
 			const pumpStart = REAL.now();
-			for (let i = 0; i < options.maxFrames; i++) {
+			for (let i = 0; i < simulationLimit; i++) {
 				W.__circlooTasPumpFrame();
 				frames++;
 				updateCheckpointTracking();
+				samplePoint();
 
 				if (options.target === 'cp' && state.cpTimes[targetCP] != null && state.collectedCP >= targetCP) {
 					score = state.cpTimes[targetCP];
@@ -4002,6 +4178,7 @@
 					reached = true;
 					break;
 				}
+				if (options.target === 'point' && gameFrame() >= pointMaxFrame) break;
 			}
 			const pumpMs = REAL.now() - pumpStart;
 			const finalPlayer = gmPlayer();
@@ -4015,6 +4192,8 @@
 				reached,
 				cp: state.collectedCP,
 				times: state.cpTimes.slice(),
+				bestFrame: bestPointFrame,
+				bestPosition: bestPointPosition,
 				debug: {
 					trialMs: REAL.now() - trialStart,
 					prepareMs,
@@ -4566,6 +4745,8 @@
 		updateCheckpointTracking();
 		updateVelocity();
 		updateFreezeHint();
+		installPointPicker();
+		updatePointMarker();
 		recordRunFrame();
 		post('TELEMETRY', telemetry());
 		REAL.raf(monitorTick);
@@ -4627,6 +4808,15 @@
 				break;
 			case 'SET_VOLUME':
 				setVolume(message.volume);
+				break;
+			case 'SET_POINT_TARGET':
+				setPointTarget(message);
+				break;
+			case 'START_POINT_PICK':
+				setPointTarget({ ...message, enabled: true, picking: true });
+				break;
+			case 'CANCEL_POINT_PICK':
+				setPointTarget({ ...state.pointTarget, picking: false });
 				break;
 		}
 	}
@@ -4744,6 +4934,7 @@
 		W.addEventListener('message', handleMessage, true);
 		if (!IS_SIM) {
 			installDomInputCapture();
+			installPointPicker();
 			resetCapture({ preserve: false });
 		}
 

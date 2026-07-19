@@ -3,7 +3,6 @@
 	import {
 		ClipboardCopy,
 		FileDown,
-		Info,
 		Maximize2,
 		RefreshCcw,
 		Volume2,
@@ -12,15 +11,19 @@
 	} from '@lucide/svelte';
 	import {
 		appMessage,
-		type BruteforceDebug,
-		type BruteforceDebugStats,
 		type BruteforceProgress,
 		type BruteforceSettings,
 		type BruteforceWorkerMessage,
 		type GameMessage,
 		type Telemetry
 	} from '$lib/tas/protocol';
-	import { gameTime, normalizeScript, serializeScript, type ScriptEntry } from '$lib/tas/script';
+	import {
+		gameTime,
+		normalizeScript,
+		serializeScript,
+		validateNormalizedScript,
+		type ScriptEntry
+	} from '$lib/tas/script';
 
 	const defaultText = '';
 	const scriptKey = 'circloo-tas:script';
@@ -30,6 +33,11 @@
 		target: 'finish',
 		targetCP: 1,
 		finishCP: 6,
+		pointX: 1500,
+		pointY: 1670,
+		pointZ: 0,
+		pointMinFrame: 0,
+		pointMaxFrame: 520,
 		maxFrames: 520,
 		minFrame: 386,
 		maxFrame: 520,
@@ -54,8 +62,6 @@
 	let bruteforceGeneration = 0;
 	let poolForceFullRuntime = false;
 	let retiredTrials = 0;
-	let retiredImprovements = 0;
-	let retiredVerified = 0;
 	let gameRevision = $state(0);
 	let volume = $state(0.8);
 	let scriptText = $state(defaultText);
@@ -84,25 +90,14 @@
 		running: false,
 		best: [] as ScriptEntry[],
 		bestScore: Infinity,
-		lastScore: Infinity,
-		lastReached: false,
 		trials: 0,
-		improvements: 0,
-		startedAt: 0,
 		rate: 0,
-		mode: '',
-		rewindFrame: null as number | null,
-		snapshotCount: 0,
-		optimizerBuildMs: 0,
-		optimizerValidated: false,
-		optimizerFallbackReason: '',
-		verified: 0,
 		workers: 0,
 		workerLimit: 1,
 		scaling: false,
-		debug: null as BruteforceDebug | null,
 		lastError: ''
 	});
+	let pointPicking = $state(false);
 
 	const gameUrl = $derived(`/game/index.html?view=1&rev=${gameRevision}`);
 	const parsedScript = $derived(normalizeScript(scriptText));
@@ -110,10 +105,37 @@
 	const inputLabel = $derived(`${lineCount} ${lineCount === 1 ? 'input' : 'inputs'}`);
 	const targetCPNumber = $derived(Math.max(1, Math.floor(Number(settings.targetCP) || 1)));
 	const finishCPNumber = $derived(Math.max(1, Math.floor(Number(settings.finishCP) || 1)));
+	const pointXNumber = $derived(Number.isFinite(Number(settings.pointX)) ? Number(settings.pointX) : 0);
+	const pointYNumber = $derived(Number.isFinite(Number(settings.pointY)) ? Number(settings.pointY) : 0);
+	const pointZNumber = $derived(Number.isFinite(Number(settings.pointZ)) ? Number(settings.pointZ) : 0);
+	const pointMinFrameNumber = $derived(Math.max(0, Math.floor(Number(settings.pointMinFrame) || 0)));
+	const pointMaxFrameNumber = $derived(
+		Math.max(pointMinFrameNumber, Math.floor(Number(settings.pointMaxFrame) || pointMinFrameNumber))
+	);
+	const pointPickAvailable = $derived(
+		settings.target === 'point' &&
+		telemetry.gameplayReady &&
+		telemetry.level === bruteforceLevel()
+	);
 	const scoredCPNumber = $derived(settings.target === 'cp' ? targetCPNumber : finishCPNumber);
 	const selectedTargetTime = $derived(telemetry.cpTimes[scoredCPNumber] ?? null);
-	const targetLabel = $derived(settings.target === 'cp' ? `Target CP ${targetCPNumber}` : `Finish CP ${finishCPNumber}`);
-	const bruteforceTargetLabel = $derived(settings.target === 'cp' ? `scoring CP ${targetCPNumber}` : `scoring finish CP ${finishCPNumber}`);
+	const selectedTargetDisplay = $derived(
+		settings.target === 'point' ? 'See red point marker' : gameTime(selectedTargetTime)
+	);
+	const targetLabel = $derived(
+		settings.target === 'cp'
+			? `Target CP ${targetCPNumber}`
+			: settings.target === 'finish'
+				? `Finish CP ${finishCPNumber}`
+				: 'Point distance'
+	);
+	const bruteforceTargetLabel = $derived(
+		settings.target === 'cp'
+			? `Checkpoint ${targetCPNumber}`
+			: settings.target === 'finish'
+				? `Finish at CP ${finishCPNumber}`
+				: `Point (${formatCoordinate(pointXNumber)}, ${formatCoordinate(pointYNumber)}, ${formatCoordinate(pointZNumber)}) · frames ${pointMinFrameNumber}–${pointMaxFrameNumber}`
+	);
 	const checkpointRows = $derived(
 		Array.from({ length: finishCPNumber }, (_, index) => {
 			const cp = index + 1;
@@ -126,18 +148,22 @@
 	);
 	const volumePercent = $derived(Math.round(volume * 100));
 	const bruteforceRate = $derived(bruteforce.rate);
+	const bruteforceBestLabel = $derived(
+		settings.target === 'point'
+			? Number.isFinite(bruteforce.bestScore)
+				? `${formatDistance(bruteforce.bestScore)} px`
+				: '--'
+			: gameTime(bruteforce.bestScore)
+	);
 
-	function debugMs(value: number | null | undefined) {
-		const n = Number(value);
-		if (!Number.isFinite(n)) return '--';
-		return n >= 10 ? n.toFixed(1) : n.toFixed(2);
+	function formatCoordinate(value: number) {
+		return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.00$/, '');
 	}
 
-	function runtimeModeLabel(mode: string) {
-		if (mode === 'wasm-runtime') return 'validated Wasm runtime';
-		if (mode === 'deterministic-rewind') return 'validated rewind';
-		if (mode === 'mixed-runtime') return 'mixed exact modes';
-		return 'full runtime';
+	function formatDistance(value: number) {
+		if (!Number.isFinite(value)) return '--';
+		if (value < 0.001) return value.toExponential(2);
+		return value.toFixed(value < 10 ? 4 : 2);
 	}
 
 	function postToGame(type: string, payload: Record<string, unknown> = {}) {
@@ -254,8 +280,19 @@
 		setStatus('Reloading game runtime');
 	}
 
-	function saveSettings() {
+	function saveSettings(options: { preserveResults?: boolean } | Event = {}) {
+		const preserveResults = !(options instanceof Event) && options.preserveResults === true;
+		if (settings.target !== 'point') pointPicking = false;
+		if (!bruteforce.running && !preserveResults) {
+			bruteforce.best = [];
+			bruteforce.bestScore = Infinity;
+			bruteforce.trials = 0;
+			bruteforce.rate = 0;
+			bruteforce.workers = 0;
+			bruteforce.lastError = '';
+		}
 		localStorage.setItem(settingsKey, JSON.stringify(settings));
+		syncPointTarget();
 	}
 
 	function resetBruteforceSettings() {
@@ -267,6 +304,43 @@
 	function bruteforceLevel() {
 		const level = Math.floor(Number(settings.level));
 		return Number.isFinite(level) ? Math.max(0, level) : 1;
+	}
+
+	function normalizedBruteforceSettings(
+		value: Partial<BruteforceSettings>
+	): BruteforceSettings {
+		const source = { ...defaultBruteforceSettings, ...value };
+		const finite = (candidate: unknown, fallback: number) => {
+			return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : fallback;
+		};
+		const integer = (candidate: unknown, fallback: number, minimum = 0) =>
+			Math.max(minimum, Math.floor(finite(candidate, fallback)));
+		const target =
+			source.target === 'cp' || source.target === 'finish' || source.target === 'point'
+				? source.target
+				: defaultBruteforceSettings.target;
+		const pointMinFrame = integer(source.pointMinFrame, defaultBruteforceSettings.pointMinFrame);
+		return {
+			level: integer(source.level, defaultBruteforceSettings.level),
+			target,
+			targetCP: integer(source.targetCP, defaultBruteforceSettings.targetCP, 1),
+			finishCP: integer(source.finishCP, defaultBruteforceSettings.finishCP, 1),
+			pointX: finite(source.pointX, defaultBruteforceSettings.pointX),
+			pointY: finite(source.pointY, defaultBruteforceSettings.pointY),
+			pointZ: finite(source.pointZ, defaultBruteforceSettings.pointZ),
+			pointMinFrame,
+			pointMaxFrame: Math.max(
+				pointMinFrame,
+				integer(source.pointMaxFrame, defaultBruteforceSettings.pointMaxFrame)
+			),
+			maxFrames: integer(source.maxFrames, defaultBruteforceSettings.maxFrames, 1),
+			minFrame: integer(source.minFrame, defaultBruteforceSettings.minFrame),
+			maxFrame: integer(source.maxFrame, defaultBruteforceSettings.maxFrame),
+			mutRange: integer(source.mutRange, defaultBruteforceSettings.mutRange),
+			mutStep: integer(source.mutStep, defaultBruteforceSettings.mutStep, 1),
+			warmup: Math.min(120, integer(source.warmup, defaultBruteforceSettings.warmup)),
+			autoUseBest: source.autoUseBest === true
+		};
 	}
 
 	function loadSettings() {
@@ -286,7 +360,9 @@
 				saved.mutStep === 1 &&
 				saved.warmup === 0 &&
 				saved.autoUseBest === false;
-			settings = isLegacyDefault ? { ...defaultBruteforceSettings } : { ...settings, ...saved };
+			settings = isLegacyDefault
+				? { ...defaultBruteforceSettings }
+				: normalizedBruteforceSettings(saved);
 		} catch {
 			localStorage.removeItem(settingsKey);
 		}
@@ -305,70 +381,37 @@
 		return activeWorkerSlots().reduce((total, slot) => total + (slot.progress?.trials ?? 0), 0);
 	}
 
-	function aggregateDebug(slots: BruteforceWorkerSlot[], latest: BruteforceProgress): BruteforceDebug | null {
-		const reports = slots.flatMap((slot) => (slot.progress?.debug ? [slot.progress] : []));
-		if (!reports.length || !latest.debug) return latest.debug ?? null;
-		const keys: (keyof BruteforceDebugStats)[] = [
-			'workerMs',
-			'mutateMs',
-			'trialMs',
-			'prepareMs',
-			'pumpMs',
-			'frames',
-			'prepPumps'
-		];
-		const weight = reports.reduce((total, report) => total + Math.max(1, report.trials), 0);
-		const avg = {} as BruteforceDebugStats;
-		for (const key of keys) {
-			avg[key] =
-				reports.reduce(
-					(total, report) => total + (report.debug?.avg[key] ?? 0) * Math.max(1, report.trials),
-					0
-				) / weight;
-		}
-		return { last: latest.debug.last, avg };
-	}
-
 	function aggregateBruteforce(latest: BruteforceProgress) {
 		const slots = activeWorkerSlots();
 		const reports = slots.flatMap((slot) => (slot.progress ? [slot.progress] : []));
 		const previousBest = bruteforce.bestScore;
 		const bestReport = reports
-			.filter((report) => report.bestReached && Number.isFinite(report.bestScore))
-			.sort((left, right) => left.bestScore - right.bestScore)[0];
-		const improvedGlobally = !!bestReport && bestReport.bestScore < previousBest;
+			.map((report) => ({ report, script: validateNormalizedScript(report.bestScript) }))
+			.filter(
+				(candidate): candidate is { report: BruteforceProgress; script: ScriptEntry[] } =>
+					candidate.report.bestReached &&
+					Number.isFinite(candidate.report.bestScore) &&
+					candidate.script !== null &&
+					candidate.script.length > 0
+			)
+			.sort((left, right) => left.report.bestScore - right.report.bestScore)[0];
+		const improvedGlobally = !!bestReport && bestReport.report.bestScore < previousBest;
 
 		bruteforce.trials = retiredTrials + reports.reduce((total, report) => total + report.trials, 0);
 		bruteforce.rate = reports.reduce((total, report) => total + report.rate, 0);
-		bruteforce.improvements =
-			retiredImprovements + reports.reduce((total, report) => total + report.improvements, 0);
-		bruteforce.verified = retiredVerified + reports.reduce((total, report) => total + report.verified, 0);
-		bruteforce.lastScore = latest.lastScore;
-		bruteforce.lastReached = latest.lastReached;
 		bruteforce.workers = slots.length;
-		bruteforce.rewindFrame = latest.rewindFrame;
-		bruteforce.snapshotCount = reports.reduce(
-			(maximum, report) => Math.max(maximum, report.snapshotCount),
-			0
-		);
-		bruteforce.optimizerBuildMs = reports.reduce(
-			(maximum, report) => Math.max(maximum, report.optimizerBuildMs),
-			0
-		);
-		bruteforce.optimizerValidated = reports.some((report) => report.optimizerValidated);
-		bruteforce.optimizerFallbackReason =
-			reports.find((report) => report.optimizerFallbackReason)?.optimizerFallbackReason ?? '';
-		const modes = [...new Set(reports.map((report) => report.mode))];
-		bruteforce.mode = modes.length === 1 ? modes[0] : modes.length > 1 ? 'mixed-runtime' : '';
-		bruteforce.debug = aggregateDebug(slots, latest);
 		bruteforce.lastError = latest.error ?? '';
 
 		if (bestReport && (improvedGlobally || !Number.isFinite(bruteforce.bestScore))) {
-			bruteforce.best = bestReport.bestScript;
-			bruteforce.bestScore = bestReport.bestScore;
+			bruteforce.best = bestReport.script;
+			bruteforce.bestScore = bestReport.report.bestScore;
 			if (improvedGlobally && Number.isFinite(previousBest)) {
-				setStatus(`Improved to ${gameTime(bestReport.bestScore)}`);
-				if (settings.autoUseBest) setScriptText(serializeScript(bestReport.bestScript));
+				setStatus(
+					settings.target === 'point'
+						? `Improved to ${formatDistance(bestReport.report.bestScore)} px`
+						: `Improved to ${gameTime(bestReport.report.bestScore)}`
+				);
+				if (settings.autoUseBest) setScriptText(serializeScript(bestReport.script));
 			}
 		}
 	}
@@ -378,8 +421,6 @@
 		slot.stopped = true;
 		if (countWork && slot.progress) {
 			retiredTrials += slot.progress.trials;
-			retiredImprovements += slot.progress.improvements;
-			retiredVerified += slot.progress.verified;
 		}
 		try {
 			slot.worker.postMessage(appMessage('STOP_BRUTEFORCE'));
@@ -526,32 +567,19 @@
 		const base = normalizeScript(scriptText);
 		if (!base.length) return setError('No script to bruteforce');
 
+		settings = normalizedBruteforceSettings(settings);
 		saveSettings();
 		setScriptText(serializeScript(base));
 		bruteforce.running = true;
 		bruteforce.best = base;
 		bruteforce.bestScore = Infinity;
-		bruteforce.lastScore = Infinity;
-		bruteforce.lastReached = false;
 		bruteforce.trials = 0;
-		bruteforce.improvements = 0;
-		bruteforce.startedAt = performance.now();
 		bruteforce.rate = 0;
-		bruteforce.mode = '';
-		bruteforce.rewindFrame = null;
-		bruteforce.snapshotCount = 0;
-		bruteforce.optimizerBuildMs = 0;
-		bruteforce.optimizerValidated = false;
-		bruteforce.optimizerFallbackReason = '';
-		bruteforce.verified = 0;
 		bruteforce.workers = 0;
 		bruteforce.workerLimit = workerCapacity();
 		bruteforce.scaling = true;
-		bruteforce.debug = null;
 		bruteforce.lastError = '';
 		retiredTrials = 0;
-		retiredImprovements = 0;
-		retiredVerified = 0;
 		poolForceFullRuntime = false;
 		nextBruteforceWorkerId = 0;
 		const generation = ++bruteforceGeneration;
@@ -572,9 +600,44 @@
 	}
 
 	function useBest() {
-		if (!bruteforce.best.length) return setError('No bruteforce best script yet');
-		setScriptText(serializeScript(bruteforce.best));
+		const best = validateNormalizedScript(bruteforce.best);
+		if (!best?.length) return setError('No valid bruteforce best script yet');
+		setScriptText(serializeScript(best));
 		setStatus('Loaded bruteforce best');
+	}
+
+	function syncPointTarget() {
+		if (!pointPickAvailable && pointPicking) pointPicking = false;
+		postToGame('SET_POINT_TARGET', {
+			enabled: pointPickAvailable,
+			x: pointXNumber,
+			y: pointYNumber,
+			z: pointZNumber,
+			picking: pointPickAvailable && pointPicking
+		});
+	}
+
+	function togglePointPicking() {
+		if (!pointPickAvailable) {
+			setError(`Open Level ${bruteforceLevel()} in the game before picking a point`);
+			return;
+		}
+		pointPicking = !pointPicking;
+		postToGame(pointPicking ? 'START_POINT_PICK' : 'CANCEL_POINT_PICK', {
+			x: pointXNumber,
+			y: pointYNumber,
+			z: pointZNumber
+		});
+	}
+
+	function handlePointCoordinateInput() {
+		saveSettings();
+	}
+
+	function handlePointWindowChange() {
+		settings.pointMinFrame = pointMinFrameNumber;
+		settings.pointMaxFrame = pointMaxFrameNumber;
+		saveSettings();
 	}
 
 	function handleGameMessage(event: MessageEvent<GameMessage>) {
@@ -587,29 +650,49 @@
 			case 'GAME_READY':
 				telemetry = message;
 				postToGame('SET_VOLUME', { volume });
+				syncPointTarget();
 				syncReplayFromEditor(scriptText, true);
 				break;
 			case 'RUN_READY':
 				if (message.requestId === replayRequestId) {
+					const contextChanged =
+						telemetry.level !== message.level ||
+						telemetry.gameplayReady !== message.gameplayReady;
 					telemetry = message;
+					if (contextChanged) syncPointTarget();
 					setStatus('Deterministic run ready');
 				}
 				break;
-			case 'TELEMETRY':
+			case 'TELEMETRY': {
+				const contextChanged =
+					telemetry.level !== message.level ||
+					telemetry.gameplayReady !== message.gameplayReady;
 				telemetry = message;
+				if (contextChanged) syncPointTarget();
 				break;
-				case 'CAPTURE_DUMP':
-					void copyRecoveredInputs(message.text);
-					break;
-				case 'RUN_DUMP':
-					downloadTextFile(message.filename, message.text);
-					showToast(`Run log saved (${message.frames} frames)`);
-					break;
-				case 'ERROR':
-					if (message.requestId == null || message.requestId === replayRequestId) {
-						setError(message.message);
-					}
-					break;
+			}
+			case 'POINT_TARGET_PICKED':
+				if (!pointPicking || settings.target !== 'point') break;
+				if (![message.x, message.y, message.z].every(Number.isFinite)) break;
+				settings.pointX = message.x;
+				settings.pointY = message.y;
+				settings.pointZ = message.z;
+				pointPicking = false;
+				saveSettings();
+				showToast('Point target selected');
+				break;
+			case 'CAPTURE_DUMP':
+				void copyRecoveredInputs(message.text);
+				break;
+			case 'RUN_DUMP':
+				downloadTextFile(message.filename, message.text);
+				showToast(`Run log saved (${message.frames} frames)`);
+				break;
+			case 'ERROR':
+				if (message.requestId == null || message.requestId === replayRequestId) {
+					setError(message.message);
+				}
+				break;
 		}
 	}
 
@@ -697,7 +780,7 @@
 				</div>
 				<div>
 					<span>{targetLabel}</span>
-					<strong>{gameTime(selectedTargetTime)}</strong>
+					<strong>{selectedTargetDisplay}</strong>
 				</div>
 				<div>
 					<span>Input</span>
@@ -733,146 +816,124 @@
 					</button>
 				</div>
 
-				<div class="settings-grid">
-					<label>
-						<span class="setting-label">
-							Level
-							<span class="info-dot" aria-label="Level number the worker starts for every bruteforce candidate." data-tip="Level number the worker starts for every bruteforce candidate. This is explicit and does not follow the currently visible game level.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="0" bind:value={settings.level} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Target
-							<span class="info-dot" aria-label="Which result the bruteforce scores: reaching a checkpoint or finishing." data-tip="Which result the bruteforce scores: reaching a checkpoint or finishing.">
-								<Info size={13} />
-							</span>
-						</span>
-						<select bind:value={settings.target} onchange={saveSettings}>
-							<option value="cp">Checkpoint</option>
-							<option value="finish">Finish</option>
-						</select>
-					</label>
-					<label>
-						<span class="setting-label">
-							CP N
-							<span class="info-dot" aria-label="Checkpoint number to score when Target is Checkpoint." data-tip="Checkpoint number to score when Target is Checkpoint.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="1" bind:value={settings.targetCP} onchange={saveSettings} disabled={settings.target !== 'cp'} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Finish CPs
-							<span class="info-dot" aria-label="Checkpoint count required for a candidate to count as finished." data-tip="Checkpoint count required for a candidate to count as finished.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="1" bind:value={settings.finishCP} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Max frames
-							<span class="info-dot" aria-label="Maximum simulated frames before a candidate is abandoned." data-tip="Maximum simulated frames before a candidate is abandoned.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="60" bind:value={settings.maxFrames} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Modify from
-							<span class="info-dot" aria-label="Earliest frame the bruteforce may modify." data-tip="Inputs before this frame are never added, moved, deleted, or changed. This setting does not choose the rewind point; each candidate rewinds to the nearest deterministic snapshot before its earliest changed input.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="0" bind:value={settings.minFrame} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Modify through
-							<span class="info-dot" aria-label="Latest frame the bruteforce may modify." data-tip="Highest script frame the bruteforce may add, move, delete, or change. Set 0 to use Max frames.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="0" bind:value={settings.maxFrame} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Mutation
-							<span class="info-dot" aria-label="Largest frame offset used when mutating script input changes." data-tip="Largest frame offset used when mutating script input changes.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="0" bind:value={settings.mutRange} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Step
-							<span class="info-dot" aria-label="Frame granularity for mutations. Higher values search coarser changes." data-tip="Frame granularity for mutations. Higher values search coarser changes.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="1" bind:value={settings.mutStep} onchange={saveSettings} />
-					</label>
-					<label>
-						<span class="setting-label">
-							Warmup
-							<span class="info-dot" aria-label="Legacy setting kept for old saved settings." data-tip="Legacy setting kept for old saved settings. Scripted U inputs now control pre-start physics timing.">
-								<Info size={13} />
-							</span>
-						</span>
-						<input type="number" min="0" max="120" bind:value={settings.warmup} onchange={saveSettings} />
-					</label>
-					<label class="checkline">
-						<input type="checkbox" bind:checked={settings.autoUseBest} onchange={saveSettings} />
-						<span class="setting-label">
-							Auto-load best
-							<span class="info-dot" aria-label="Automatically writes each new best script into the editor, which also applies it to replay." data-tip="Automatically writes each new best script into the editor, which also applies it to replay.">
-								<Info size={13} />
-							</span>
-						</span>
-					</label>
-				</div>
+				<fieldset class="bruteforce-settings" disabled={bruteforce.running}>
+					<section class="settings-section" aria-labelledby="general-info-heading">
+						<h3 id="general-info-heading">General info</h3>
+						<div class="settings-grid">
+							<label>
+								<span class="setting-label">Level</span>
+								<input type="number" min="0" bind:value={settings.level} onchange={saveSettings} />
+							</label>
+							{#if settings.target !== 'point'}
+								<label>
+									<span class="setting-label">Max frames</span>
+									<input type="number" min="1" bind:value={settings.maxFrames} onchange={saveSettings} />
+								</label>
+							{/if}
+							<label>
+								<span class="setting-label">Warmup</span>
+								<input type="number" min="0" max="120" bind:value={settings.warmup} onchange={saveSettings} />
+							</label>
+							<label class="checkline">
+								<input
+									type="checkbox"
+									bind:checked={settings.autoUseBest}
+									onchange={() => saveSettings({ preserveResults: true })}
+								/>
+								<span class="setting-label">Auto-load best</span>
+							</label>
+						</div>
+					</section>
+
+					<section class="settings-section" aria-labelledby="target-heading">
+						<h3 id="target-heading">Target</h3>
+						<div class="settings-grid">
+							<label>
+								<span class="setting-label">Type</span>
+								<select bind:value={settings.target} onchange={saveSettings}>
+									<option value="finish">Finish</option>
+									<option value="cp">Checkpoint</option>
+									<option value="point">Point</option>
+								</select>
+							</label>
+							{#if settings.target === 'cp'}
+								<label>
+									<span class="setting-label">Checkpoint</span>
+									<input type="number" min="1" bind:value={settings.targetCP} onchange={saveSettings} />
+								</label>
+							{:else if settings.target === 'finish'}
+								<label>
+									<span class="setting-label">Finish CPs</span>
+									<input type="number" min="1" bind:value={settings.finishCP} onchange={saveSettings} />
+								</label>
+							{:else}
+								<label>
+									<span class="setting-label">X</span>
+									<input type="number" step="any" bind:value={settings.pointX} oninput={handlePointCoordinateInput} />
+								</label>
+								<label>
+									<span class="setting-label">Y</span>
+									<input type="number" step="any" bind:value={settings.pointY} oninput={handlePointCoordinateInput} />
+								</label>
+								<label>
+									<span class="setting-label">Z</span>
+									<input type="number" step="any" bind:value={settings.pointZ} oninput={handlePointCoordinateInput} />
+								</label>
+								<label>
+									<span class="setting-label">Min frame</span>
+									<input type="number" min="0" bind:value={settings.pointMinFrame} onchange={handlePointWindowChange} />
+								</label>
+								<label>
+									<span class="setting-label">Max frame</span>
+									<input type="number" min={pointMinFrameNumber} bind:value={settings.pointMaxFrame} onchange={handlePointWindowChange} />
+								</label>
+								<div class="point-picker-control">
+									<span class="setting-label">Pick in level</span>
+									<button class:primary={pointPicking} disabled={!pointPickAvailable} onclick={togglePointPicking}>
+										{pointPicking
+											? 'Cancel picking'
+											: pointPickAvailable
+												? 'Pick point'
+												: `Open Level ${bruteforceLevel()} to pick`}
+									</button>
+								</div>
+							{/if}
+						</div>
+					</section>
+
+					<section class="settings-section" aria-labelledby="input-modification-heading">
+						<h3 id="input-modification-heading">Input modification</h3>
+						<div class="settings-grid">
+							<label>
+								<span class="setting-label">Modify from</span>
+								<input type="number" min="0" bind:value={settings.minFrame} onchange={saveSettings} />
+							</label>
+							<label>
+								<span class="setting-label">Modify through</span>
+								<input type="number" min="0" bind:value={settings.maxFrame} onchange={saveSettings} />
+							</label>
+							<label>
+								<span class="setting-label">Mutation</span>
+								<input type="number" min="0" bind:value={settings.mutRange} onchange={saveSettings} />
+							</label>
+							<label>
+								<span class="setting-label">Step</span>
+								<input type="number" min="1" bind:value={settings.mutStep} onchange={saveSettings} />
+							</label>
+						</div>
+					</section>
+				</fieldset>
 
 				<div class="bruteforce-stats">
-					<span>{bruteforce.trials} trials</span>
+					<span>{bruteforceRate.toFixed(1)} iterations/s</span>
+					<span>{bruteforce.trials} total trials</span>
+					<span>best {bruteforceBestLabel}</span>
+					<span>{bruteforce.workers} {bruteforce.workers === 1 ? 'worker' : 'workers'}</span>
 					<span>{bruteforceTargetLabel}</span>
-					<span>{bruteforceRate.toFixed(1)}/s</span>
-					<span>{bruteforce.workers}/{bruteforce.workerLimit} workers{bruteforce.scaling ? ' (calibrating)' : ''}</span>
-					<span>best {gameTime(bruteforce.bestScore)}</span>
-					<span>{bruteforce.improvements} improvements</span>
-					<span>{bruteforce.verified} exact checks</span>
-					{#if bruteforce.mode}
-						<span>{runtimeModeLabel(bruteforce.mode)}</span>
-					{/if}
-					{#if bruteforce.optimizerFallbackReason && bruteforce.mode !== 'deterministic-rewind'}
-						<span>exact fallback: {bruteforce.optimizerFallbackReason}</span>
-					{/if}
-					{#if bruteforce.rewindFrame != null}
-						<span>last rewind {bruteforce.rewindFrame}</span>
-						<span>{bruteforce.snapshotCount} snapshots</span>
-						<span>snapshot build {debugMs(bruteforce.optimizerBuildMs)}ms</span>
-					{/if}
 				</div>
-				{#if bruteforce.debug}
-					<div class="bruteforce-debug" aria-label="Bruteforce performance debug">
-						<span>last worker {debugMs(bruteforce.debug.last.workerMs)}ms</span>
-						<span>avg worker {debugMs(bruteforce.debug.avg.workerMs)}ms</span>
-						<span>trial {debugMs(bruteforce.debug.avg.trialMs)}ms</span>
-						<span>prep {debugMs(bruteforce.debug.avg.prepareMs)}ms</span>
-						<span>pump {debugMs(bruteforce.debug.avg.pumpMs)}ms</span>
-						<span>mutate {debugMs(bruteforce.debug.avg.mutateMs)}ms</span>
-						<span>frames {Math.round(bruteforce.debug.avg.frames)}</span>
-						<span>prep pumps {Math.round(bruteforce.debug.avg.prepPumps)}</span>
-					</div>
-				{/if}
 				<div class="button-row">
 					<button onclick={useBest}>Use Best</button>
-					<button onclick={resetBruteforceSettings}><RefreshCcw size={16} />Reset defaults</button>
+					<button disabled={bruteforce.running} onclick={resetBruteforceSettings}><RefreshCcw size={16} />Reset defaults</button>
 				</div>
 				{#if bruteforce.lastError}
 					<p class="error">{bruteforce.lastError}</p>
@@ -948,15 +1009,13 @@
 	}
 
 	.telemetry-band,
-	.bruteforce-stats,
-	.bruteforce-debug {
+	.bruteforce-stats {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 8px;
 	}
 
-	.bruteforce-stats span,
-	.bruteforce-debug span {
+	.bruteforce-stats span {
 		min-height: 28px;
 		display: inline-flex;
 		align-items: center;
@@ -966,17 +1025,6 @@
 		padding: 0 10px;
 		border-radius: 6px;
 		font-variant-numeric: tabular-nums;
-	}
-
-	.bruteforce-debug {
-		margin-top: 8px;
-		font-size: 0.78rem;
-	}
-
-	.bruteforce-debug span {
-		min-height: 24px;
-		color: #a9a395;
-		background: #12140f;
 	}
 
 	.main-grid {
@@ -1222,6 +1270,40 @@
 		gap: 8px;
 	}
 
+	.bruteforce-settings {
+		display: grid;
+		gap: 10px;
+		min-width: 0;
+		margin: 0;
+		border: 0;
+		padding: 0;
+	}
+
+	.settings-section {
+		border: 1px solid #34372f;
+		border-radius: 8px;
+		background: #141611;
+		padding: 10px;
+	}
+
+	.settings-section h3 {
+		margin: 0 0 8px;
+		font-size: 0.76rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: #e4ddcf;
+	}
+
+	.point-picker-control {
+		display: flex;
+		flex-direction: column;
+		justify-content: end;
+	}
+
+	.point-picker-control button {
+		width: 100%;
+	}
+
 	label span {
 		display: block;
 		margin-bottom: 4px;
@@ -1236,60 +1318,11 @@
 		gap: 5px;
 	}
 
-	.info-dot {
-		position: relative;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		width: 16px;
-		height: 16px;
-		border: 1px solid #55594f;
-		border-radius: 999px;
-		color: #cec6b7;
-		font-size: 0.68rem;
-		line-height: 1;
-		text-transform: none;
-		cursor: help;
-	}
-
-	.info-dot::after {
-		content: attr(data-tip);
-		position: absolute;
-		left: 50%;
-		bottom: calc(100% + 8px);
-		z-index: 5;
-		width: max-content;
-		max-width: 230px;
-		padding: 8px 9px;
-		border: 1px solid #55594f;
-		border-radius: 6px;
-		background: #11130f;
-		color: #efeadd;
-		font-size: 0.74rem;
-		font-weight: 500;
-		line-height: 1.35;
-		text-transform: none;
-		white-space: normal;
-		box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
-		opacity: 0;
-		pointer-events: none;
-		transform: translate(-50%, 4px);
-		transition:
-			opacity 120ms ease,
-			transform 120ms ease;
-	}
-
-	.info-dot:hover::after,
-	.info-dot:focus-visible::after {
-		opacity: 1;
-		transform: translate(-50%, 0);
-	}
-
 	.checkline {
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		grid-column: span 2;
+		grid-column: 1 / -1;
 		min-height: 34px;
 	}
 
