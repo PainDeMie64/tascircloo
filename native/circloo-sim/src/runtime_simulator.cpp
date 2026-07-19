@@ -44,6 +44,7 @@ RuntimeSimulator::RuntimeSimulator(const RuntimeModel& model)
     world_.SetWarmStarting(model.world.warm_starting);
     world_.SetContinuousPhysics(model.world.continuous_physics);
     world_.SetSubStepping(model.world.sub_stepping);
+    world_.SetPreviousInverseTimeStep(model.world.step_rate);
 
     std::size_t maximum_body_count = model.bodies.size();
     for (const ModelWorldPatch& patch : model.growth_patches) {
@@ -55,11 +56,17 @@ RuntimeSimulator::RuntimeSimulator(const RuntimeModel& model)
     for (const ModelBody& body : model.bodies) {
         CreateBody(body);
     }
+    for (const ModelJoint& joint : model.joints) {
+        CreateJoint(joint);
+    }
     if (model.player.body_index < 0 ||
         static_cast<std::size_t>(model.player.body_index) >= bodies_.size()) {
         InvalidModel();
     }
     player_ = bodies_[static_cast<std::size_t>(model.player.body_index)];
+    world_.InitializeSnapshotContacts();
+    RestoreBodyKinematics();
+    RestoreContacts();
 
     state_.frame = model.lifecycle.initial_frame;
     state_.checkpoint = model.lifecycle.initial_checkpoint;
@@ -75,6 +82,136 @@ RuntimeSimulator::RuntimeSimulator(const RuntimeModel& model)
                state_.boundary_radius_pixels) {
         ++next_growth_patch_;
     }
+}
+
+b2Fixture* RuntimeSimulator::FixtureAt(
+    std::int32_t body_index,
+    std::int32_t fixture_index
+) {
+    if (body_index < 0 || fixture_index < 0 ||
+        static_cast<std::size_t>(body_index) >= bodies_.size()) {
+        return nullptr;
+    }
+    b2Fixture* fixture = bodies_[static_cast<std::size_t>(body_index)]->GetFixtureList();
+    for (std::int32_t index = 0; fixture && index < fixture_index; ++index) {
+        fixture = fixture->GetNext();
+    }
+    return fixture;
+}
+
+void RuntimeSimulator::RestoreBodyKinematics() {
+    if (model_.bodies.size() > bodies_.size()) {
+        InvalidModel();
+    }
+    for (std::size_t index = 0; index < model_.bodies.size(); ++index) {
+        const ModelBody& source = model_.bodies[index];
+        b2Body* body = bodies_[index];
+        body->SetAwake(source.awake);
+        body->SetLinearVelocity(b2Vec2(source.linear_velocity.x, source.linear_velocity.y));
+        body->SetAngularVelocity(source.angular_velocity);
+        body->SetSleepTime(source.sleep_time);
+    }
+}
+
+void RuntimeSimulator::RestoreContacts() {
+    for (const ModelContact& source : model_.contacts) {
+        b2Fixture* fixture_a = FixtureAt(source.body_a_index, source.fixture_a_index);
+        b2Fixture* fixture_b = FixtureAt(source.body_b_index, source.fixture_b_index);
+        if (!fixture_a || !fixture_b) {
+            InvalidModel();
+        }
+
+        b2Contact* matched = nullptr;
+        for (b2Contact* contact = world_.GetContactList(); contact; contact = contact->GetNext()) {
+            if (contact->GetFixtureA() == fixture_a &&
+                contact->GetChildIndexA() == source.child_a &&
+                contact->GetFixtureB() == fixture_b &&
+                contact->GetChildIndexB() == source.child_b) {
+                matched = contact;
+                break;
+            }
+        }
+        if (!matched) {
+            InvalidModel();
+        }
+
+        std::uint32_t ids[2]{};
+        double normal_impulses[2]{};
+        double tangent_impulses[2]{};
+        for (std::int32_t index = 0; index < source.point_count; ++index) {
+            ids[index] = source.points[static_cast<std::size_t>(index)].id;
+            normal_impulses[index] =
+                source.points[static_cast<std::size_t>(index)].normal_impulse;
+            tangent_impulses[index] =
+                source.points[static_cast<std::size_t>(index)].tangent_impulse;
+        }
+        matched->SetCapturedSolverState(
+            source.flags,
+            source.friction,
+            source.restitution,
+            source.tangent_speed,
+            source.toi_count,
+            source.toi,
+            source.point_count,
+            ids,
+            normal_impulses,
+            tangent_impulses
+        );
+    }
+}
+
+b2Joint* RuntimeSimulator::CreateJoint(const ModelJoint& source) {
+    if (source.body_a_index < 0 || source.body_b_index < 0 ||
+        static_cast<std::size_t>(source.body_a_index) >= bodies_.size() ||
+        static_cast<std::size_t>(source.body_b_index) >= bodies_.size()) {
+        InvalidModel();
+    }
+    b2Body* body_a = bodies_[static_cast<std::size_t>(source.body_a_index)];
+    b2Body* body_b = bodies_[static_cast<std::size_t>(source.body_b_index)];
+
+    switch (source.type) {
+        case ModelJointType::Revolute: {
+            b2RevoluteJointDef definition;
+            definition.Initialize(
+                body_a,
+                body_b,
+                b2Vec2(source.anchor_a.x, source.anchor_a.y)
+            );
+            definition.referenceAngle = source.reference_angle;
+            definition.lowerAngle = source.lower_angle;
+            definition.upperAngle = source.upper_angle;
+            definition.maxMotorTorque = source.max_motor_torque;
+            definition.motorSpeed = source.motor_speed;
+            definition.collideConnected = source.collide_connected;
+            definition.enableLimit = source.enable_limit;
+            definition.enableMotor = source.enable_motor;
+            auto* joint = static_cast<b2RevoluteJoint*>(world_.CreateJoint(&definition));
+            joint->SetCapturedSolverState(
+                source.impulse.x,
+                source.impulse.y,
+                source.impulse_z,
+                source.motor_impulse,
+                static_cast<b2LimitState>(source.limit_state)
+            );
+            return joint;
+        }
+        case ModelJointType::Rope: {
+            b2RopeJointDef definition;
+            definition.bodyA = body_a;
+            definition.bodyB = body_b;
+            definition.localAnchorA.Set(source.local_anchor_a.x, source.local_anchor_a.y);
+            definition.localAnchorB.Set(source.local_anchor_b.x, source.local_anchor_b.y);
+            definition.maxLength = source.max_length;
+            definition.collideConnected = source.collide_connected;
+            auto* joint = static_cast<b2RopeJoint*>(world_.CreateJoint(&definition));
+            joint->SetCapturedSolverState(
+                source.impulse.x,
+                static_cast<b2LimitState>(source.limit_state)
+            );
+            return joint;
+        }
+    }
+    InvalidModel();
 }
 
 b2Body* RuntimeSimulator::CreateBody(const ModelBody& source) {
@@ -253,7 +390,7 @@ void RuntimeSimulator::CollectCurrentPosition() {
             continue;
         }
         const ModelCollectible& collectible = model_.collectibles[index];
-        if (!collectible.active || collectible.excluded) {
+        if (!collectible.active || collectible.excluded || !collectible.player_triggered) {
             continue;
         }
 

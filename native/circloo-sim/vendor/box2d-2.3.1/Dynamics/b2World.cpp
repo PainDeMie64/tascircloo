@@ -23,6 +23,7 @@
 #include <Box2D/Dynamics/Joints/b2PulleyJoint.h>
 #include <Box2D/Dynamics/Contacts/b2Contact.h>
 #include <Box2D/Dynamics/Contacts/b2ContactSolver.h>
+#include <Box2D/Dynamics/b2DeterministicContactOrder.h>
 #include <Box2D/Collision/b2Collision.h>
 #include <Box2D/Collision/b2BroadPhase.h>
 #include <Box2D/Collision/Shapes/b2CircleShape.h>
@@ -33,6 +34,8 @@
 #include <Box2D/Common/b2Draw.h>
 #include <Box2D/Common/b2Timer.h>
 #include <new>
+#include <algorithm>
+#include <vector>
 
 b2World::b2World(const b2Vec2& gravity)
 {
@@ -894,6 +897,63 @@ void b2World::SolveTOI(const b2TimeStep& step)
 	}
 }
 
+void b2World::InitializeSnapshotContacts()
+{
+	m_contactManager.FindNewContacts();
+	m_flags &= ~e_newFixture;
+	m_contactManager.Collide();
+	SortContactsDeterministically();
+}
+
+void b2World::SortContactsDeterministically()
+{
+	std::vector<b2Contact*> contacts;
+	contacts.reserve(static_cast<std::size_t>(m_contactManager.m_contactCount));
+	for (b2Contact* contact = m_contactManager.m_contactList; contact; contact = contact->m_next)
+	{
+		contacts.push_back(contact);
+	}
+	std::sort(
+		contacts.begin(),
+		contacts.end(),
+		b2_deterministic_contact_order::ContactDescending
+	);
+
+	m_contactManager.m_contactList = contacts.empty() ? NULL : contacts.front();
+	for (std::size_t index = 0; index < contacts.size(); ++index)
+	{
+		contacts[index]->m_prev = index > 0 ? contacts[index - 1] : NULL;
+		contacts[index]->m_next = index + 1 < contacts.size() ? contacts[index + 1] : NULL;
+	}
+
+	for (b2Body* body = m_bodyList; body; body = body->m_next)
+	{
+		std::vector<b2ContactEdge*> edges;
+		for (b2ContactEdge* edge = body->m_contactList; edge; edge = edge->next)
+		{
+			edges.push_back(edge);
+		}
+		std::sort(
+			edges.begin(),
+			edges.end(),
+			[](const b2ContactEdge* left, const b2ContactEdge* right)
+			{
+				return b2_deterministic_contact_order::ContactDescending(
+					left->contact,
+					right->contact
+				);
+			}
+		);
+
+		body->m_contactList = edges.empty() ? NULL : edges.front();
+		for (std::size_t index = 0; index < edges.size(); ++index)
+		{
+			edges[index]->prev = index > 0 ? edges[index - 1] : NULL;
+			edges[index]->next = index + 1 < edges.size() ? edges[index + 1] : NULL;
+		}
+	}
+}
+
 void b2World::Step(float32 dt, int32 velocityIterations, int32 positionIterations)
 {
 	b2Timer stepTimer;
@@ -928,6 +988,7 @@ void b2World::Step(float32 dt, int32 velocityIterations, int32 positionIteration
 	{
 		b2Timer timer;
 		m_contactManager.Collide();
+		SortContactsDeterministically();
 		m_profile.collide = timer.GetMilliseconds();
 	}
 

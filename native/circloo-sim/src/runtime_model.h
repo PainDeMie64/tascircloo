@@ -78,6 +78,62 @@ struct ModelCollectible {
     bool excluded = false;
     bool counts_checkpoint = true;
     bool starts_growth_alarm = true;
+    bool player_triggered = true;
+};
+
+enum class ModelJointType : std::int32_t {
+    Revolute = 1,
+    Rope = 10
+};
+
+struct ModelJoint {
+    ModelJointType type = ModelJointType::Revolute;
+    std::int32_t body_a_index = -1;
+    std::int32_t body_b_index = -1;
+    ModelVec2 anchor_a{};
+    ModelVec2 anchor_b{};
+    ModelVec2 local_anchor_a{};
+    ModelVec2 local_anchor_b{};
+    double reference_angle = 0.0;
+    double lower_angle = 0.0;
+    double upper_angle = 0.0;
+    double max_motor_torque = 0.0;
+    double motor_speed = 0.0;
+    double max_length = 0.0;
+    ModelVec2 impulse{};
+    double impulse_z = 0.0;
+    double motor_impulse = 0.0;
+    std::int32_t limit_state = 0;
+    bool collide_connected = false;
+    bool enable_limit = false;
+    bool enable_motor = false;
+};
+
+struct ModelContactPoint {
+    ModelVec2 local_point{};
+    double normal_impulse = 0.0;
+    double tangent_impulse = 0.0;
+    std::uint32_t id = 0;
+};
+
+struct ModelContact {
+    std::int32_t body_a_index = -1;
+    std::int32_t fixture_a_index = -1;
+    std::int32_t child_a = 0;
+    std::int32_t body_b_index = -1;
+    std::int32_t fixture_b_index = -1;
+    std::int32_t child_b = 0;
+    std::uint32_t flags = 0;
+    double friction = 0.0;
+    double restitution = 0.0;
+    double tangent_speed = 0.0;
+    std::int32_t toi_count = 0;
+    double toi = 0.0;
+    std::int32_t manifold_type = 0;
+    ModelVec2 local_normal{};
+    ModelVec2 local_point{};
+    std::array<ModelContactPoint, 2> points{};
+    std::int32_t point_count = 0;
 };
 
 struct ModelWorldPatch {
@@ -128,6 +184,8 @@ struct RuntimeModel {
     ModelPlayerRules player{};
     ModelLifecycle lifecycle{};
     std::vector<ModelBody> bodies{};
+    std::vector<ModelContact> contacts{};
+    std::vector<ModelJoint> joints{};
     std::vector<ModelCollectible> collectibles{};
     std::vector<ModelWorldPatch> growth_patches{};
 };

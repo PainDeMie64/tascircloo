@@ -1045,6 +1045,7 @@
 			bodyA = typeof joint._pG1 === 'function' ? joint._pG1() : joint._eF1 || null;
 			bodyB = typeof joint._qG1 === 'function' ? joint._qG1() : joint._cF1 || null;
 		} catch {}
+		const impulse = joint && joint._1P1;
 		return {
 			index,
 			type: typeof joint._bs1 === 'function' ? joint._bs1() : finiteNumber(joint._oR1),
@@ -1052,6 +1053,15 @@
 			bodyB: bodyIds.get(bodyB) ?? null,
 			anchorA: typeof joint._rG1 === 'function' ? vec(joint._rG1()) : null,
 			anchorB: typeof joint._sG1 === 'function' ? vec(joint._sG1()) : null,
+			localAnchorA: typeof joint._jP1 === 'function' ? vec(joint._jP1()) : null,
+			localAnchorB: typeof joint._kP1 === 'function' ? vec(joint._kP1()) : null,
+			impulse: typeof impulse === 'number'
+				? { x: impulse, y: 0, z: 0 }
+				: impulse
+					? { x: finiteNumber(impulse.x), y: finiteNumber(impulse.y), z: finiteNumber(impulse._kC) }
+					: null,
+			motorImpulse: finiteNumber(joint && joint._6P1),
+			limitState: finiteNumber(joint && (joint._9P1 ?? joint._cT1)),
 			collideConnected: !!joint._iF1,
 			raw: primitiveFields(joint, 56)
 		};
@@ -4303,6 +4313,7 @@
 			const world = physicsWorld();
 			const bodies = [];
 			const bodyIds = new Map();
+			const fixtureIds = new Map();
 			for (
 				let body = world && typeof world._DF1 === 'function' ? world._DF1() : null, bodyIndex = 0;
 				body;
@@ -4315,6 +4326,10 @@
 					fixture;
 					fixture = typeof fixture._kD1 === 'function' ? fixture._kD1() : null
 				) {
+					fixtureIds.set(fixture, {
+						bodyIndex,
+						fixtureIndex: fixtures.length
+					});
 					const shape =
 						typeof fixture._ED1 === 'function'
 							? fixture._ED1()
@@ -4362,6 +4377,55 @@
 					fixedRotation: typeof body._gD1 === 'function' ? !!body._gD1() : false,
 					body: serial(body),
 					fixtures
+				});
+			}
+			const contacts = [];
+			for (
+				let contact = world && typeof world._jD1 === 'function'
+					? world._jD1()
+					: world && world._eC1
+						? world._eC1._JB1
+						: null, contactIndex = 0;
+				contact;
+				contact = typeof contact._kD1 === 'function' ? contact._kD1() : contact._LB1 || null, contactIndex++
+			) {
+				const fixtureA = typeof contact._pC1 === 'function' ? contact._pC1() : contact._2G1 || null;
+				const fixtureB = typeof contact._rC1 === 'function' ? contact._rC1() : contact._4G1 || null;
+				const fixtureRefA = fixtureIds.get(fixtureA);
+				const fixtureRefB = fixtureIds.get(fixtureB);
+				const manifold = typeof contact._OL1 === 'function' ? contact._OL1() : contact._IL1 || null;
+				const points = [];
+				const pointCount = Math.max(0, Math.min(2, Number(manifold && manifold._cw1) || 0));
+				for (let pointIndex = 0; pointIndex < pointCount; pointIndex++) {
+					const point = manifold._aw1 && manifold._aw1[pointIndex];
+					const id = point && point.id;
+					points.push({
+						localPoint: vec(point && point._5w1),
+						normalImpulse: Number(point && point._6w1) || 0,
+						tangentImpulse: Number(point && point._7w1) || 0,
+						id: id && typeof id._qH === 'function' ? Number(id._qH()) : 0
+					});
+				}
+				contacts.push({
+					index: contactIndex,
+					bodyA: fixtureRefA ? fixtureRefA.bodyIndex : null,
+					fixtureA: fixtureRefA ? fixtureRefA.fixtureIndex : null,
+					childA: typeof contact._tF1 === 'function' ? Number(contact._tF1()) : Number(contact._LL1) || 0,
+					bodyB: fixtureRefB ? fixtureRefB.bodyIndex : null,
+					fixtureB: fixtureRefB ? fixtureRefB.fixtureIndex : null,
+					childB: typeof contact._vF1 === 'function' ? Number(contact._vF1()) : Number(contact._ML1) || 0,
+					flags: Number(contact._zB1) || 0,
+					friction: typeof contact._ND1 === 'function' ? Number(contact._ND1()) : Number(contact._CD1) || 0,
+					restitution: typeof contact._OD1 === 'function' ? Number(contact._OD1()) : Number(contact._DD1) || 0,
+					tangentSpeed: typeof contact._VL1 === 'function' ? Number(contact._VL1()) : Number(contact._NL1) || 0,
+					toiCount: Number(contact._8G1) || 0,
+					toi: Number(contact._9G1) || 0,
+					manifold: {
+						type: Number(manifold && manifold.type) || 0,
+						localNormal: vec(manifold && manifold._bw1),
+						localPoint: vec(manifold && manifold._5w1),
+						points
+					}
 				});
 			}
 			const joints = [];
@@ -4413,6 +4477,7 @@
 						jointCount: joints.length
 					}
 					: null,
+				contacts,
 				joints,
 				player: (() => {
 					const player = gmPlayer();

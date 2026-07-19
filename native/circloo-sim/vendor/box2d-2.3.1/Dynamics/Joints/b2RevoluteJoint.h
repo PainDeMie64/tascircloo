@@ -90,6 +90,18 @@ struct b2RevoluteJointDef : public b2JointDef
 class b2RevoluteJoint : public b2Joint
 {
 public:
+	void SetCapturedSolverState(
+		float32 impulseX,
+		float32 impulseY,
+		float32 impulseZ,
+		float32 motorImpulse,
+		b2LimitState limitState
+	) {
+		m_impulse.Set(impulseX, impulseY, impulseZ);
+		m_motorImpulse = motorImpulse;
+		m_limitState = limitState;
+	}
+
 	b2Vec2 GetAnchorA() const;
 	b2Vec2 GetAnchorB() const;
 

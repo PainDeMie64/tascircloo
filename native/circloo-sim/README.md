@@ -10,12 +10,14 @@ The runtime model is not tied to a level number. It supports:
 - static, kinematic, and dynamic bodies;
 - circle, edge, polygon, and chain fixtures;
 - fixture material and collision-filter properties;
+- revolute and rope joints, including cached solver state;
+- deterministic contact ordering and contact warm-start snapshots;
 - player input rules;
 - collectible checkpoints;
 - delayed boundary replacement and body-spawn patches.
 
-Unsupported mechanics, such as joints, are rejected before search and retain
-the GameMaker full-runtime path.
+Unsupported captured mechanics are rejected before search and retain the
+GameMaker full-runtime path.
 
 ## Correctness contract
 
@@ -29,6 +31,10 @@ replayed in the original GameMaker runtime before it is accepted. Continuous
 floating-point tail state is diagnostic rather than an acceptance condition,
 because independent GameMaker replays can differ at approximately 1e-13 while
 producing identical checkpoint results.
+
+The all-level production classifier currently validates the custom runtime on
+all 20 levels: Level 1 selects deterministic rewind and Levels 2 through 20
+select Wasm.
 
 ## Build and test
 

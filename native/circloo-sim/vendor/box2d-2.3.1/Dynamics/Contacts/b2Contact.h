@@ -141,6 +141,20 @@ public:
 	/// Get the desired tangent speed. In meters per second.
 	float32 GetTangentSpeed() const;
 
+	/// Restore cached solver state from a live-world snapshot.
+	void SetCapturedSolverState(
+		uint32 flags,
+		float32 friction,
+		float32 restitution,
+		float32 tangentSpeed,
+		int32 toiCount,
+		float32 toi,
+		int32 pointCount,
+		const uint32* ids,
+		const float32* normalImpulses,
+		const float32* tangentImpulses
+	);
+
 	/// Evaluate this contact with your own manifold and transforms.
 	virtual void Evaluate(b2Manifold* manifold, const b2Transform& xfA, const b2Transform& xfB) = 0;
 
@@ -344,6 +358,49 @@ inline void b2Contact::SetTangentSpeed(float32 speed)
 inline float32 b2Contact::GetTangentSpeed() const
 {
 	return m_tangentSpeed;
+}
+
+inline void b2Contact::SetCapturedSolverState(
+	uint32 flags,
+	float32 friction,
+	float32 restitution,
+	float32 tangentSpeed,
+	int32 toiCount,
+	float32 toi,
+	int32 pointCount,
+	const uint32* ids,
+	const float32* normalImpulses,
+	const float32* tangentImpulses
+)
+{
+	m_flags = flags & ~e_islandFlag;
+	m_friction = friction;
+	m_restitution = restitution;
+	m_tangentSpeed = tangentSpeed;
+	m_toiCount = toiCount;
+	m_toi = toi;
+	for (int32 manifoldIndex = 0; manifoldIndex < m_manifold.pointCount; ++manifoldIndex)
+	{
+		b2ManifoldPoint& point = m_manifold.points[manifoldIndex];
+		int32 capturedIndex = -1;
+		for (int32 index = 0; index < pointCount; ++index)
+		{
+			if (point.id.key == ids[index])
+			{
+				capturedIndex = index;
+				break;
+			}
+		}
+		if (capturedIndex < 0 && manifoldIndex < pointCount)
+		{
+			capturedIndex = manifoldIndex;
+		}
+		if (capturedIndex >= 0)
+		{
+			point.normalImpulse = normalImpulses[capturedIndex];
+			point.tangentImpulse = tangentImpulses[capturedIndex];
+		}
+	}
 }
 
 #endif

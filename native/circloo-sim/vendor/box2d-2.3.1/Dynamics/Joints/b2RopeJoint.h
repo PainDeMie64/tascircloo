@@ -58,6 +58,11 @@ struct b2RopeJointDef : public b2JointDef
 class b2RopeJoint : public b2Joint
 {
 public:
+	void SetCapturedSolverState(float32 impulse, b2LimitState state) {
+		m_impulse = impulse;
+		m_state = state;
+	}
+
 	b2Vec2 GetAnchorA() const;
 	b2Vec2 GetAnchorB() const;
 

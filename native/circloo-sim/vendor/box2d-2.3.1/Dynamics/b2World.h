@@ -157,6 +157,12 @@ public:
 	void SetSubStepping(bool flag) { m_subStepping = flag; }
 	bool GetSubStepping() const { return m_subStepping; }
 
+	/// Restore the previous inverse time step when rebuilding a live world.
+	void SetPreviousInverseTimeStep(float32 inverseTimeStep) { m_inv_dt0 = inverseTimeStep; }
+
+	/// Build and update the contact graph without advancing simulation time.
+	void InitializeSnapshotContacts();
+
 	/// Get the number of broad-phase proxies.
 	int32 GetProxyCount() const;
 
@@ -226,6 +232,7 @@ private:
 
 	void Solve(const b2TimeStep& step);
 	void SolveTOI(const b2TimeStep& step);
+	void SortContactsDeterministically();
 
 	void DrawJoint(b2Joint* joint);
 	void DrawShape(b2Fixture* shape, const b2Transform& xf, const b2Color& color);

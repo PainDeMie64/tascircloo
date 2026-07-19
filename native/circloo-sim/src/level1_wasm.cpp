@@ -378,6 +378,119 @@ std::int32_t circloo_model_set_player(
     return 1;
 }
 
+std::int32_t circloo_model_add_joint(
+    std::int32_t type,
+    std::int32_t body_a_handle,
+    std::int32_t body_b_handle,
+    double anchor_a_x,
+    double anchor_a_y,
+    double anchor_b_x,
+    double anchor_b_y,
+    double local_anchor_a_x,
+    double local_anchor_a_y,
+    double local_anchor_b_x,
+    double local_anchor_b_y,
+    double reference_angle,
+    double lower_angle,
+    double upper_angle,
+    double max_motor_torque,
+    double motor_speed,
+    double max_length,
+    double impulse_x,
+    double impulse_y,
+    double impulse_z,
+    double motor_impulse,
+    std::int32_t limit_state,
+    std::int32_t flags
+) {
+    const std::int32_t body_a_index = InitialBodyIndex(body_a_handle);
+    const std::int32_t body_b_index = InitialBodyIndex(body_b_handle);
+    if (body_a_index < 0 || body_b_index < 0 || (type != 1 && type != 10)) {
+        return 0;
+    }
+    circloo::ModelJoint joint;
+    joint.type = static_cast<circloo::ModelJointType>(type);
+    joint.body_a_index = body_a_index;
+    joint.body_b_index = body_b_index;
+    joint.anchor_a = circloo::ModelVec2{anchor_a_x, anchor_a_y};
+    joint.anchor_b = circloo::ModelVec2{anchor_b_x, anchor_b_y};
+    joint.local_anchor_a = circloo::ModelVec2{local_anchor_a_x, local_anchor_a_y};
+    joint.local_anchor_b = circloo::ModelVec2{local_anchor_b_x, local_anchor_b_y};
+    joint.reference_angle = reference_angle;
+    joint.lower_angle = lower_angle;
+    joint.upper_angle = upper_angle;
+    joint.max_motor_torque = max_motor_torque;
+    joint.motor_speed = motor_speed;
+    joint.max_length = max_length;
+    joint.impulse = circloo::ModelVec2{impulse_x, impulse_y};
+    joint.impulse_z = impulse_z;
+    joint.motor_impulse = motor_impulse;
+    joint.limit_state = limit_state;
+    joint.collide_connected = (flags & 1) != 0;
+    joint.enable_limit = (flags & 2) != 0;
+    joint.enable_motor = (flags & 4) != 0;
+    LoadedModel().joints.push_back(joint);
+    return 1;
+}
+
+std::int32_t circloo_model_add_contact(
+    std::int32_t body_a_handle,
+    std::int32_t fixture_a_index,
+    std::int32_t child_a,
+    std::int32_t body_b_handle,
+    std::int32_t fixture_b_index,
+    std::int32_t child_b,
+    std::int32_t flags,
+    double friction,
+    double restitution,
+    double tangent_speed,
+    std::int32_t toi_count,
+    double toi,
+    std::int32_t point_count,
+    double point0_x,
+    double point0_y,
+    double point0_normal_impulse,
+    double point0_tangent_impulse,
+    std::int32_t point0_id,
+    double point1_x,
+    double point1_y,
+    double point1_normal_impulse,
+    double point1_tangent_impulse,
+    std::int32_t point1_id
+) {
+    const std::int32_t body_a_index = InitialBodyIndex(body_a_handle);
+    const std::int32_t body_b_index = InitialBodyIndex(body_b_handle);
+    if (body_a_index < 0 || body_b_index < 0 ||
+        fixture_a_index < 0 || fixture_b_index < 0 ||
+        point_count < 0 || point_count > 2) {
+        return 0;
+    }
+    circloo::ModelContact contact;
+    contact.body_a_index = body_a_index;
+    contact.fixture_a_index = fixture_a_index;
+    contact.child_a = child_a;
+    contact.body_b_index = body_b_index;
+    contact.fixture_b_index = fixture_b_index;
+    contact.child_b = child_b;
+    contact.flags = static_cast<std::uint32_t>(flags);
+    contact.friction = friction;
+    contact.restitution = restitution;
+    contact.tangent_speed = tangent_speed;
+    contact.toi_count = toi_count;
+    contact.toi = toi;
+    contact.point_count = point_count;
+    contact.points[0].local_point = circloo::ModelVec2{point0_x, point0_y};
+    contact.points[0].normal_impulse = point0_normal_impulse;
+    contact.points[0].tangent_impulse = point0_tangent_impulse;
+    contact.points[0].id = static_cast<std::uint32_t>(point0_id);
+    contact.points[1].local_point = circloo::ModelVec2{point1_x, point1_y};
+    contact.points[1].normal_impulse = point1_normal_impulse;
+    contact.points[1].tangent_impulse = point1_tangent_impulse;
+    contact.points[1].id = static_cast<std::uint32_t>(point1_id);
+    LoadedModel().contacts.push_back(contact);
+    return 1;
+}
+
 std::int32_t circloo_model_add_circle_fixture(
     std::int32_t target_type,
     std::int32_t target_index,
@@ -538,6 +651,7 @@ std::int32_t circloo_model_add_collectible(
     collectible.excluded = (flags & 4) != 0;
     collectible.counts_checkpoint = (flags & 8) != 0;
     collectible.starts_growth_alarm = (flags & 16) != 0;
+    collectible.player_triggered = (flags & 32) != 0;
     LoadedModel().collectibles.push_back(collectible);
     return 1;
 }
@@ -553,6 +667,28 @@ std::int32_t circloo_model_finalize() {
     for (const auto& patch : model.growth_patches) {
         if (patch.replace_body_index >= 0 &&
             static_cast<std::size_t>(patch.replace_body_index) >= model.bodies.size()) {
+            ModelReady() = false;
+            return 0;
+        }
+    }
+    for (const auto& joint : model.joints) {
+        if (joint.body_a_index < 0 || joint.body_b_index < 0 ||
+            static_cast<std::size_t>(joint.body_a_index) >= model.bodies.size() ||
+            static_cast<std::size_t>(joint.body_b_index) >= model.bodies.size()) {
+            ModelReady() = false;
+            return 0;
+        }
+    }
+    for (const auto& contact : model.contacts) {
+        if (contact.body_a_index < 0 || contact.body_b_index < 0 ||
+            static_cast<std::size_t>(contact.body_a_index) >= model.bodies.size() ||
+            static_cast<std::size_t>(contact.body_b_index) >= model.bodies.size() ||
+            contact.fixture_a_index < 0 || contact.fixture_b_index < 0 ||
+            static_cast<std::size_t>(contact.fixture_a_index) >=
+                model.bodies[static_cast<std::size_t>(contact.body_a_index)].fixtures.size() ||
+            static_cast<std::size_t>(contact.fixture_b_index) >=
+                model.bodies[static_cast<std::size_t>(contact.body_b_index)].fixtures.size() ||
+            contact.point_count < 0 || contact.point_count > 2) {
             ModelReady() = false;
             return 0;
         }

@@ -53,7 +53,11 @@ private:
     std::size_t next_growth_patch_ = 0;
 
     b2Body* CreateBody(const ModelBody& source);
+    b2Joint* CreateJoint(const ModelJoint& source);
     b2Fixture* CreateFixture(b2Body& body, const ModelFixture& source);
+    b2Fixture* FixtureAt(std::int32_t body_index, std::int32_t fixture_index);
+    void RestoreContacts();
+    void RestoreBodyKinematics();
     void ReplaceFixtures(b2Body& body, const std::vector<ModelFixture>& fixtures);
     void ApplyGrowthPatch(const ModelWorldPatch& patch);
     void AdvanceGrowthAlarm();

@@ -21,6 +21,9 @@
 #include <Box2D/Dynamics/b2Fixture.h>
 #include <Box2D/Dynamics/b2WorldCallbacks.h>
 #include <Box2D/Dynamics/Contacts/b2Contact.h>
+#include <Box2D/Dynamics/b2DeterministicContactOrder.h>
+
+#include <utility>
 
 b2ContactFilter b2_defaultFilter;
 b2ContactListener b2_defaultListener;
@@ -184,6 +187,18 @@ void b2ContactManager::AddPair(void* proxyUserDataA, void* proxyUserDataB)
 
 	int32 indexA = proxyA->childIndex;
 	int32 indexB = proxyB->childIndex;
+
+	// Broad-phase callbacks are not required to return a stable A/B orientation.
+	// Canonicalize before filtering or manifold construction so equivalent runs
+	// cannot enter Box2D through opposite floating-point code paths.
+	if (b2_deterministic_contact_order::CompareEndpointKeys(
+			b2_deterministic_contact_order::MakeEndpointKey(fixtureA, indexA),
+			b2_deterministic_contact_order::MakeEndpointKey(fixtureB, indexB)
+		) > 0)
+	{
+		std::swap(fixtureA, fixtureB);
+		std::swap(indexA, indexB);
+	}
 
 	b2Body* bodyA = fixtureA->GetBody();
 	b2Body* bodyB = fixtureB->GetBody();

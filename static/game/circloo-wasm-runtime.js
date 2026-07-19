@@ -51,7 +51,8 @@
 			bit(!!collectible.collected, 2) |
 			bit(!!collectible.excluded, 4) |
 			bit(collectible.countsCheckpoint !== false, 8) |
-			bit(collectible.startsGrowthAlarm !== false, 16)
+			bit(collectible.startsGrowthAlarm !== false, 16) |
+			bit(collectible.playerTriggered !== false, 32)
 		);
 	}
 
@@ -139,6 +140,100 @@
 		};
 	}
 
+	function normalizeContact(source, inspectionBodies, bodyIndexById) {
+		const originalA = inspectionBodies[integer(source && source.bodyA, -1)];
+		const originalB = inspectionBodies[integer(source && source.bodyB, -1)];
+		const bodyAIndex = bodyIndexById.get(integer(originalA && originalA.userId, -1));
+		const bodyBIndex = bodyIndexById.get(integer(originalB && originalB.userId, -1));
+		const manifold = source && source.manifold ? source.manifold : {};
+		return {
+			bodyAIndex: Number.isInteger(bodyAIndex) ? bodyAIndex : -1,
+			fixtureAIndex: integer(source && source.fixtureA, -1),
+			childA: integer(source && source.childA),
+			bodyBIndex: Number.isInteger(bodyBIndex) ? bodyBIndex : -1,
+			fixtureBIndex: integer(source && source.fixtureB, -1),
+			childB: integer(source && source.childB),
+			flags: integer(source && source.flags),
+			friction: finite(source && source.friction),
+			restitution: finite(source && source.restitution),
+			tangentSpeed: finite(source && source.tangentSpeed),
+			toiCount: integer(source && source.toiCount),
+			toi: finite(source && source.toi),
+			manifold: {
+				type: integer(manifold.type),
+				localNormal: {
+					x: finite(manifold.localNormal && manifold.localNormal.x),
+					y: finite(manifold.localNormal && manifold.localNormal.y)
+				},
+				localPoint: {
+					x: finite(manifold.localPoint && manifold.localPoint.x),
+					y: finite(manifold.localPoint && manifold.localPoint.y)
+				},
+				points: (manifold.points || []).slice(0, 2).map((point) => ({
+					localPoint: {
+						x: finite(point && point.localPoint && point.localPoint.x),
+						y: finite(point && point.localPoint && point.localPoint.y)
+					},
+					normalImpulse: finite(point && point.normalImpulse),
+					tangentImpulse: finite(point && point.tangentImpulse),
+					id: integer(point && point.id)
+				}))
+			}
+		};
+	}
+
+	function localPoint(body, point) {
+		const dx = finite(point && point.x) - finite(body && body.position && body.position.x);
+		const dy = finite(point && point.y) - finite(body && body.position && body.position.y);
+		const angle = finite(body && body.angle);
+		const cosine = Math.cos(angle);
+		const sine = Math.sin(angle);
+		return {
+			x: cosine * dx + sine * dy,
+			y: -sine * dx + cosine * dy
+		};
+	}
+
+	function normalizeJoint(source, inspectionBodies, bodyIndexById) {
+		const raw = source && source.raw ? source.raw : {};
+		const originalA = inspectionBodies[integer(source && source.bodyA, -1)];
+		const originalB = inspectionBodies[integer(source && source.bodyB, -1)];
+		const bodyAIndex = bodyIndexById.get(integer(originalA && originalA.userId, -1));
+		const bodyBIndex = bodyIndexById.get(integer(originalB && originalB.userId, -1));
+		const anchorA = source && source.anchorA ? source.anchorA : {};
+		const anchorB = source && source.anchorB ? source.anchorB : anchorA;
+		const impulse = source && source.impulse ? source.impulse : {};
+		return {
+			type: integer(source && source.type, -1),
+			bodyAIndex: Number.isInteger(bodyAIndex) ? bodyAIndex : -1,
+			bodyBIndex: Number.isInteger(bodyBIndex) ? bodyBIndex : -1,
+			anchorA: { x: finite(anchorA.x), y: finite(anchorA.y) },
+			anchorB: { x: finite(anchorB.x), y: finite(anchorB.y) },
+			localAnchorA: source && source.localAnchorA
+				? { x: finite(source.localAnchorA.x), y: finite(source.localAnchorA.y) }
+				: localPoint(originalA, anchorA),
+			localAnchorB: source && source.localAnchorB
+				? { x: finite(source.localAnchorB.x), y: finite(source.localAnchorB.y) }
+				: localPoint(originalB, anchorB),
+			referenceAngle: finite(raw._0P1),
+			lowerAngle: finite(raw._2P1),
+			upperAngle: finite(raw._3P1),
+			maxMotorTorque: finite(raw._4P1),
+			motorSpeed: finite(raw._5P1),
+			maxLength: finite(raw._bT1),
+			impulse: {
+				x: finite(impulse.x),
+				y: finite(impulse.y),
+				z: finite(impulse.z)
+			},
+			motorImpulse: finite(source && source.motorImpulse, raw._6P1),
+			limitState: integer(source && source.limitState, raw._9P1 ?? raw._cT1),
+			collideConnected: !!(source && source.collideConnected),
+			enableLimit: !!raw._7P1,
+			enableMotor: !!raw._8P1
+		};
+	}
+
 	function boundaryPatchFixture(state, fallbackFixture) {
 		const filter = state && state.filter ? state.filter : fallbackFixture.filter;
 		const vertices = Array.isArray(state && state.vertices)
@@ -215,10 +310,6 @@
 			throw new Error('Compact physics inspection is invalid');
 		}
 		const unsupportedReasons = [];
-		if (Array.isArray(inspection.joints) && inspection.joints.length) {
-			unsupportedReasons.push(`joints:${inspection.joints.length}`);
-		}
-
 		// Box2D body linked lists are newest-first. Reversing restores the exact
 		// construction order that controls broad-phase and contact ordering.
 		const bodies = inspection.bodies.slice().reverse().map(normalizeBody);
@@ -277,10 +368,28 @@
 				checkpointFrames
 			},
 			bodies,
+			contacts: [],
+			joints: [],
 			collectibles: [],
 			growthPatches: [],
 			unsupportedReasons
 		};
+		for (const source of inspection.contacts || []) {
+			const contact = normalizeContact(source, inspection.bodies, bodyIndexById);
+			if (!contact.manifold.points.length) continue;
+			if (contact.bodyAIndex < 0 || contact.bodyBIndex < 0 ||
+				contact.fixtureAIndex < 0 || contact.fixtureBIndex < 0) {
+				unsupportedReasons.push('contact-endpoint');
+				continue;
+			}
+			model.contacts.push(contact);
+		}
+		for (const source of (inspection.joints || []).slice().reverse()) {
+			const joint = normalizeJoint(source, inspection.bodies, bodyIndexById);
+			if (joint.type !== 1 && joint.type !== 10) unsupportedReasons.push(`joint-type:${joint.type}`);
+			if (joint.bodyAIndex < 0 || joint.bodyBIndex < 0) unsupportedReasons.push('joint-body');
+			model.joints.push(joint);
+		}
 
 		for (const source of inspection.collectibles || []) {
 			const objectIndex = integer(source.objectIndex ?? source.type, -1);
@@ -302,7 +411,11 @@
 				collected: !!source.collected,
 				excluded: !!source.excluded,
 				countsCheckpoint: true,
-				startsGrowthAlarm: true
+				startsGrowthAlarm: true,
+				// Object 23 is collected by the level's special collector objects
+				// (42/43), not by player proximity. Treating it like object 21 creates
+				// false checkpoint hits when the player passes nearby.
+				playerTriggered: objectIndex === 21
 			});
 		}
 
@@ -373,6 +486,8 @@
 			setCheckpointFrame: requireExport(exports, 'circloo_model_set_checkpoint_frame'),
 			addPatch: requireExport(exports, 'circloo_model_add_patch'),
 			addBody: requireExport(exports, 'circloo_model_add_body'),
+			addJoint: requireExport(exports, 'circloo_model_add_joint'),
+			addContact: requireExport(exports, 'circloo_model_add_contact'),
 			setPlayer: requireExport(exports, 'circloo_model_set_player'),
 			addCircle: requireExport(exports, 'circloo_model_add_circle_fixture'),
 			addPolygon: requireExport(exports, 'circloo_model_add_polygon_fixture'),
@@ -528,6 +643,73 @@
 			}
 
 			const bodyHandles = model.bodies.map((body) => addBody(body));
+			for (const contact of model.contacts || []) {
+				const points = contact.manifold && Array.isArray(contact.manifold.points)
+					? contact.manifold.points.slice(0, 2)
+					: [];
+				if (!points.length) continue;
+				const point0 = points[0] || {};
+				const point1 = points[1] || {};
+				const bodyAHandle = bodyHandles[integer(contact.bodyAIndex, -1)];
+				const bodyBHandle = bodyHandles[integer(contact.bodyBIndex, -1)];
+				if (!Number.isInteger(bodyAHandle) || !Number.isInteger(bodyBHandle) || abi.addContact(
+					bodyAHandle,
+					integer(contact.fixtureAIndex, -1),
+					integer(contact.childA),
+					bodyBHandle,
+					integer(contact.fixtureBIndex, -1),
+					integer(contact.childB),
+					integer(contact.flags),
+					finite(contact.friction),
+					finite(contact.restitution),
+					finite(contact.tangentSpeed),
+					integer(contact.toiCount),
+					finite(contact.toi, 1),
+					points.length,
+					finite(point0.localPoint && point0.localPoint.x),
+					finite(point0.localPoint && point0.localPoint.y),
+					finite(point0.normalImpulse),
+					finite(point0.tangentImpulse),
+					integer(point0.id),
+					finite(point1.localPoint && point1.localPoint.x),
+					finite(point1.localPoint && point1.localPoint.y),
+					finite(point1.normalImpulse),
+					finite(point1.tangentImpulse),
+					integer(point1.id)
+				) !== 1) throw new Error('Wasm rejected contact');
+			}
+			for (const joint of model.joints || []) {
+				const bodyAHandle = bodyHandles[integer(joint.bodyAIndex, -1)];
+				const bodyBHandle = bodyHandles[integer(joint.bodyBIndex, -1)];
+				const flags = bit(!!joint.collideConnected, 1) |
+					bit(!!joint.enableLimit, 2) |
+					bit(!!joint.enableMotor, 4);
+				if (!Number.isInteger(bodyAHandle) || !Number.isInteger(bodyBHandle) || abi.addJoint(
+					integer(joint.type, -1),
+					bodyAHandle,
+					bodyBHandle,
+					finite(joint.anchorA && joint.anchorA.x),
+					finite(joint.anchorA && joint.anchorA.y),
+					finite(joint.anchorB && joint.anchorB.x),
+					finite(joint.anchorB && joint.anchorB.y),
+					finite(joint.localAnchorA && joint.localAnchorA.x),
+					finite(joint.localAnchorA && joint.localAnchorA.y),
+					finite(joint.localAnchorB && joint.localAnchorB.x),
+					finite(joint.localAnchorB && joint.localAnchorB.y),
+					finite(joint.referenceAngle),
+					finite(joint.lowerAngle),
+					finite(joint.upperAngle),
+					finite(joint.maxMotorTorque),
+					finite(joint.motorSpeed),
+					finite(joint.maxLength),
+					finite(joint.impulse && joint.impulse.x),
+					finite(joint.impulse && joint.impulse.y),
+					finite(joint.impulse && joint.impulse.z),
+					finite(joint.motorImpulse),
+					integer(joint.limitState),
+					flags
+				) !== 1) throw new Error('Wasm rejected joint');
+			}
 			const player = model.player || {};
 			const playerHandle = bodyHandles[integer(player.bodyIndex, -1)];
 			if (!Number.isInteger(playerHandle) || abi.setPlayer(
