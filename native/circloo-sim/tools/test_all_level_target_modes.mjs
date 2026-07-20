@@ -31,6 +31,57 @@ const scenarios = [
       minFrame: 150,
       maxFrame: 170
     }
+  },
+  {
+    name: 'point-level2-frame-zero-start',
+    target: 'point',
+    levels: [2],
+    base: [
+      { frame: 0, input: 'U' },
+      { frame: 0, input: 'R' },
+      { frame: 3, input: 'L' },
+      { frame: 21, input: 'LR' },
+      { frame: 22, input: 'R' },
+      { frame: 25, input: '.' },
+      { frame: 26, input: 'R' },
+      { frame: 77, input: 'L' },
+      { frame: 215, input: '.' },
+      { frame: 218, input: 'R' },
+      { frame: 219, input: 'LR' },
+      { frame: 220, input: 'R' },
+      { frame: 223, input: 'L' },
+      { frame: 232, input: 'LR' },
+      { frame: 233, input: 'R' }
+    ],
+    settings: {
+      pointX: 1119.3686,
+      pointY: 1654.937,
+      pointMinFrame: 165,
+      pointMaxFrame: 170,
+      maxFrames: 171,
+      minFrame: 1,
+      maxFrame: 170,
+      alterTimeDifference: 150
+    }
+  },
+  {
+    name: 'point-level2-long-prestart',
+    target: 'point',
+    levels: [2],
+    base: [
+      { frame: -5, input: 'U' },
+      { frame: 0, input: 'R' },
+      { frame: 3, input: 'L' }
+    ],
+    settings: {
+      pointX: 1500,
+      pointY: 1670,
+      pointMinFrame: 0,
+      pointMaxFrame: 4,
+      maxFrames: 6,
+      minFrame: 0,
+      maxFrame: 4
+    }
   }
 ];
 
@@ -93,7 +144,10 @@ const expression = `(async () => {
       warmup: 0,
       ...(scenario.settings || {})
     };
-    for (let level = ${firstLevel}; level <= ${lastLevel}; level += 1) {
+    const levels = Array.isArray(scenario.levels)
+      ? scenario.levels.filter((level) => level >= ${firstLevel} && level <= ${lastLevel})
+      : Array.from({ length: ${lastLevel - firstLevel + 1} }, (_, index) => ${firstLevel} + index);
+    for (const level of levels) {
       try {
         const result = await new Promise((resolve, reject) => {
           const version = ['target-mode', scenario.name, level, Date.now(), Math.random()].join('-');

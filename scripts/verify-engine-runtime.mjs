@@ -47,11 +47,14 @@ assert.match(worker, /mode: 'wasm-runtime'/);
 assert.match(worker, /Custom WASM engine unavailable:/);
 assert.match(worker, /current\.optimizer\.evaluate\(candidate\)/);
 assert.match(worker, /function evaluatePointThrough\(/);
+assert.match(worker, /function createSequenceInputState\(/);
 assert.match(worker, /function nextSequenceInput\(/);
+assert.match(worker, /Math\.max\(1, Math\.abs\(finiteFrame\(unfreeze\.frame, 0\)\)\)/);
+assert.match(worker, /inputState\.prestartRemaining > 0/);
 assert.match(worker, /scriptInputAtFrame\(candidateScript, frame\)/);
 assert.doesNotMatch(worker, /createSearchOptimizer|forceFullRuntime|point-target-full-runtime|pointZ/);
 assert.doesNotMatch(page, /pointZ|>Z</);
 assert.doesNotMatch(protocol, /pointZ|POINT_TARGET_PICKED'[\s\S]*z: number/);
-assert.match(html, /tas-bridge\.js\?v=71/);
+assert.match(html, /tas-bridge\.js\?v=72/);
 
 console.log('All-level custom engine support verified');

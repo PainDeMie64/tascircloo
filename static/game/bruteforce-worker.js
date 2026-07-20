@@ -1143,24 +1143,64 @@
 			return converted;
 		}
 
-		function nextSequenceInput(candidateScript, raw) {
+		function createSequenceInputState(candidateScript) {
+			const unfreeze = normalizeScript(candidateScript).find((entry) => entry.input === 'U');
+			const prestartSteps = unfreeze
+				? Math.max(1, Math.abs(finiteFrame(unfreeze.frame, 0)))
+				: 0;
+			const timerStarted =
+				!!(model && model.lifecycle && model.lifecycle.initialTimerStarted) || snapshotFrame > 0;
+			if (timerStarted) {
+				return { frozen: false, prestartRemaining: 0, initialPrestartSteps: prestartSteps };
+			}
+			if (!unfreeze) {
+				return { frozen: true, prestartRemaining: 0, initialPrestartSteps: 0 };
+			}
+			return {
+				frozen: false,
+				prestartRemaining: prestartSteps,
+				initialPrestartSteps: prestartSteps
+			};
+		}
+
+		function nextSequenceInput(candidateScript, raw, inputState) {
+			if (inputState && inputState.frozen) return 0;
+			if (inputState && inputState.prestartRemaining > 0) {
+				inputState.prestartRemaining -= 1;
+				return 0;
+			}
 			const frame = finiteFrame(raw && raw.frame, snapshotFrame);
 			return inputBits(scriptInputAtFrame(candidateScript, frame));
 		}
 
-		function sequenceStepLimit(lastGameFrame) {
-			return Math.max(0, finiteFrame(lastGameFrame, snapshotFrame) - snapshotFrame);
+		function sequenceStepLimit(lastGameFrame, inputState) {
+			if (inputState && inputState.frozen) return 0;
+			const configuredLimit = Math.max(1, finiteFrame(options && options.maxFrames, 1));
+			const simulationLimit = pointTarget
+				? Math.max(configuredLimit, pointMaxFrame + 1)
+				: configuredLimit;
+			const prestartSteps = Math.max(
+				0,
+				finiteFrame(inputState && inputState.initialPrestartSteps, 0)
+			);
+			const consumedSteps = snapshotFrame > 0 ? snapshotFrame + prestartSteps : 0;
+			const remainingBudget = Math.max(0, simulationLimit - consumedSteps);
+			const stepsToRequestedFrame =
+				Math.max(0, finiteFrame(lastGameFrame, snapshotFrame) - snapshotFrame) +
+				(snapshotFrame === 0 ? prestartSteps : 0);
+			return Math.min(remainingBudget, stepsToRequestedFrame);
 		}
 
 		function evaluatePointThrough(candidateScript, lastGameFrame, includePhysics = false) {
 			const tracker = createPointTracker();
+			const inputState = createSequenceInputState(candidateScript);
 			const trialStarted = realNow();
 			let raw = null;
 			try {
 				raw = runtime.beginSequence(includePhysics);
-				for (let index = 0; index < sequenceStepLimit(lastGameFrame); index += 1) {
+				for (let index = 0; index < sequenceStepLimit(lastGameFrame, inputState); index += 1) {
 					raw = runtime.stepSequence(
-						nextSequenceInput(candidateScript, raw),
+						nextSequenceInput(candidateScript, raw, inputState),
 						32,
 						includePhysics
 					);
@@ -1185,13 +1225,14 @@
 			);
 			if (pointTarget) return evaluatePointThrough(candidateScript, lastGameFrame, false);
 			if (snapshotFrame === 0) {
+				const inputState = createSequenceInputState(candidateScript);
 				const trialStarted = realNow();
 				let raw = null;
 				try {
 					raw = runtime.beginSequence(false);
-					for (let index = 0; index < sequenceStepLimit(lastGameFrame); index += 1) {
+					for (let index = 0; index < sequenceStepLimit(lastGameFrame, inputState); index += 1) {
 						raw = runtime.stepSequence(
-							nextSequenceInput(candidateScript, raw),
+							nextSequenceInput(candidateScript, raw, inputState),
 							checkpointTarget,
 							false
 						);
@@ -1227,12 +1268,14 @@
 		function beginFrameSequence(candidate) {
 			const candidateScript = normalizeScript(candidate);
 			if (!prefixMatches(candidateScript)) return null;
+			const inputState = createSequenceInputState(candidateScript);
 			const raw = runtime.beginSequence(true);
 			const pointTracker = pointTarget ? createPointTracker() : null;
 			return {
 				candidateScript,
+				inputState,
 				raw,
-				remainingSteps: sequenceStepLimit(maximumGameFrame),
+				remainingSteps: sequenceStepLimit(maximumGameFrame, inputState),
 				pointTracker,
 				result: pointTarget
 					? pointWasmTrialResult(raw, pointTracker)
@@ -1245,7 +1288,7 @@
 				return sequence && sequence.result;
 			}
 			const raw = runtime.stepSequence(
-				nextSequenceInput(sequence.candidateScript, sequence.raw),
+				nextSequenceInput(sequence.candidateScript, sequence.raw, sequence.inputState),
 				checkpointTarget,
 				true
 			);
@@ -1283,7 +1326,9 @@
 				modelDebug,
 				snapshotStrategy: snapshotFrame === 0 ? 'full-level' : 'mutation-window',
 				referenceFrames: Array.isArray(capture.referenceFrames)
-					? capture.referenceFrames
+					? capture.referenceFrames.filter(
+							(frame) => finiteFrame(frame && frame.frame, -1) <= maximumGameFrame
+						)
 					: [],
 				evaluate,
 				restoreVerifier() {
@@ -1549,11 +1594,11 @@
 				const fast = comparableTrialResult(fastResult);
 				const exact = comparableTrialResult(exactResult);
 				checked += 1;
-				const resultMatches = JSON.stringify(fast) === JSON.stringify(exact);
+				const resultMatches = trialResultsMatch(fastResult, exactResult, options && options.target);
 				const bodyMismatch = firstPhysicsBodyMismatch(fastResult, exactResult, true);
 				const jointMismatch = firstPhysicsJointMismatch(fastResult, exactResult, true);
 				const stateMatches = finalStateMatches(fastResult, exactResult, true) &&
-					!bodyMismatch && !jointMismatch;
+					(message.verifyEveryFrame || (!bodyMismatch && !jointMismatch));
 				if (!stateMatches) stateMismatchCount += 1;
 				if (!resultMatches || (!message.scoreOnly && !stateMatches)) {
 					firstMismatch = {
@@ -1583,42 +1628,14 @@
 				const sequence = built.optimizer.beginFrameSequence(candidate);
 				try {
 					let fastResult = sequence && sequence.result;
+					let comparedReference = false;
 					for (const referenceFrame of built.optimizer.referenceFrames) {
 						const frame = finiteFrame(referenceFrame && referenceFrame.frame, -1);
 						if (frame < built.optimizer.rewindFrame) continue;
-						while (
-							fastResult &&
-							finiteFrame(
-								fastResult.debug && fastResult.debug.finalState && fastResult.debug.finalState.frame,
-								-1
-							) < frame
-						) {
-							const previousFrame = finiteFrame(
-								fastResult.debug && fastResult.debug.finalState && fastResult.debug.finalState.frame,
-								-1
-							);
+						if (comparedReference) {
 							fastResult = built.optimizer.stepFrameSequence(sequence);
-							const nextFrame = finiteFrame(
-								fastResult && fastResult.debug && fastResult.debug.finalState && fastResult.debug.finalState.frame,
-								-1
-							);
-							if (nextFrame <= previousFrame) {
-								firstFrameMismatch = {
-									frame,
-									reason: 'wasm-sequence-stalled',
-									previousFrame,
-									nextFrame
-								};
-								firstMismatch = {
-									index: 0,
-									candidate,
-									frame,
-									reason: 'wasm-sequence-stalled'
-								};
-								break;
-							}
 						}
-						if (firstMismatch) break;
+						comparedReference = true;
 						const exactState = referenceFrame && referenceFrame.finalState;
 						const exactResult = {
 							debug: {

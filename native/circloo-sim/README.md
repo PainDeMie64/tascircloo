@@ -34,9 +34,10 @@ heuristics for every target type. Every candidate that could improve the current
 best is replayed in the original GameMaker runtime, and only that exact result
 can be accepted.
 
-The all-level target-mode matrix verifies `wasm-runtime` on all 20 levels for
-checkpoint, finish, standard point, and narrow-window idle point searches: 80
-combinations total.
+The target-mode matrix verifies `wasm-runtime` on all 20 levels for checkpoint,
+finish, standard point, and narrow-window idle point searches. It also includes
+Level 2 frame-zero-start and long-prestart point regressions: 82 combinations
+total.
 
 ## Build and test
 
