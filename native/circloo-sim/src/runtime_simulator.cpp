@@ -266,22 +266,30 @@ void RuntimeSimulator::RetryPendingInstanceContacts() {
     RestoreInstanceContacts(contacts);
 }
 
-b2Joint* RuntimeSimulator::CreateJoint(const ModelJoint& source) {
+b2Joint* RuntimeSimulator::CreateJoint(
+    const ModelJoint& source,
+    bool allow_missing_bodies
+) {
     b2Body* body_a = nullptr;
     b2Body* body_b = nullptr;
     if (source.body_a_index >= 0 &&
         static_cast<std::size_t>(source.body_a_index) < initial_bodies_.size()) {
         body_a = initial_bodies_[static_cast<std::size_t>(source.body_a_index)];
-    } else {
+    }
+    if (!body_a) {
         body_a = FindBodyByInstanceId(source.body_a_instance_id);
     }
     if (source.body_b_index >= 0 &&
         static_cast<std::size_t>(source.body_b_index) < initial_bodies_.size()) {
         body_b = initial_bodies_[static_cast<std::size_t>(source.body_b_index)];
-    } else {
+    }
+    if (!body_b) {
         body_b = FindBodyByInstanceId(source.body_b_instance_id);
     }
-    if (!body_a || !body_b) InvalidModel();
+    if (!body_a || !body_b) {
+        if (allow_missing_bodies) return nullptr;
+        InvalidModel();
+    }
 
     switch (source.type) {
         case ModelJointType::Revolute: {
@@ -507,17 +515,19 @@ void RuntimeSimulator::ApplyFramePatches(std::int32_t next_frame) {
         if (patch.frame > next_frame) {
             return;
         }
-        for (std::int32_t instance_id : patch.destroyed_instance_ids) {
-            DestroyBodyByInstanceId(instance_id);
-        }
         for (const ModelJointKey& key : patch.destroyed_joints) {
             DestroyJoint(key);
+        }
+        for (std::int32_t instance_id : patch.destroyed_instance_ids) {
+            DestroyBodyByInstanceId(instance_id);
         }
         for (const ModelBody& body : patch.spawned_bodies) {
             CreateBody(body);
         }
         for (const ModelJoint& joint : patch.spawned_joints) {
-            joints_.push_back(CreateJoint(joint));
+            if (b2Joint* created = CreateJoint(joint, true)) {
+                joints_.push_back(created);
+            }
         }
         for (const ModelBodyStateUpdate& update : patch.body_state_updates) {
             ApplyBodyStateUpdate(update);
@@ -606,6 +616,16 @@ void RuntimeSimulator::DestroyBodyByInstanceId(std::int32_t instance_id) {
         for (b2Body*& initial : initial_bodies_) {
             if (initial == body) initial = nullptr;
         }
+        joints_.erase(
+            std::remove_if(
+                joints_.begin(),
+                joints_.end(),
+                [body](b2Joint* joint) {
+                    return !joint || joint->GetBodyA() == body || joint->GetBodyB() == body;
+                }
+            ),
+            joints_.end()
+        );
         world_.DestroyBody(body);
         bodies_.erase(iterator);
         return;

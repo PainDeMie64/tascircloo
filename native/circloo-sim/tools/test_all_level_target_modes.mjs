@@ -177,6 +177,33 @@ const scenarios = [
       alterMaxInputs: 5,
       alterTimeDifference: 8
     }
+  },
+  {
+    name: 'point-level8-divergent-joint-spawn',
+    target: 'point',
+    levels: [8],
+    base: [
+      { frame: 0, input: 'U' },
+      { frame: 0, input: 'L' },
+      { frame: 13, input: 'R' },
+      { frame: 58, input: '.' },
+      { frame: 59, input: 'L' },
+      { frame: 114, input: 'R' }
+    ],
+    settings: {
+      pointX: 1733.11317,
+      pointY: 1400.1994,
+      pointMinFrame: 156,
+      pointMaxFrame: 170,
+      minCheckpoint: 0,
+      maxFrames: 3600,
+      minFrame: 108,
+      maxFrame: 180,
+      addMaxInputs: 3,
+      removeMaxInputs: 1,
+      alterMaxInputs: 5,
+      alterTimeDifference: 11
+    }
   }
 ];
 

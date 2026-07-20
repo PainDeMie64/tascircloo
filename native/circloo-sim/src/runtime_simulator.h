@@ -61,7 +61,10 @@ private:
     std::vector<ModelInstanceContact> pending_instance_contacts_{};
 
     b2Body* CreateBody(const ModelBody& source);
-    b2Joint* CreateJoint(const ModelJoint& source);
+    b2Joint* CreateJoint(
+        const ModelJoint& source,
+        bool allow_missing_bodies = false
+    );
     b2Fixture* CreateFixture(b2Body& body, const ModelFixture& source);
     b2Fixture* FixtureAt(std::int32_t body_index, std::int32_t fixture_index);
     b2Fixture* FixtureAt(b2Body* body, std::int32_t fixture_index);
